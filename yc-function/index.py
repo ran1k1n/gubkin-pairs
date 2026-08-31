@@ -196,10 +196,14 @@ def format_class(c):
     return ", ".join(parts)
 
 
-# ---------------------------------------------------------------- состояние в GitHub
+# ---------------------------------------------------------------- очередь в GitHub
 
-def gh_state_load():
-    url = GH_CONTENTS % env("GH_REPO", "ran1k1n/gubkin-pairs")
+QUEUE_URL = "https://api.github.com/repos/%s/contents/queue.json"
+
+
+def gh_load():
+    """Читает queue.json: {date, sent: [id...], pending: [{id, text}...]}."""
+    url = QUEUE_URL % env("GH_REPO", "ran1k1n/gubkin-pairs")
     headers = {
         "Authorization": "token %s" % env("GH_TOKEN"),
         "Accept": "application/vnd.github+json",
@@ -207,74 +211,88 @@ def gh_state_load():
     try:
         data = Client().get_json(url, headers)
         content = base64.b64decode(data["content"]).decode("utf-8")
-        state = json.loads(content)
-        state["_sha"] = data["sha"]
-        return state
+        q = json.loads(content)
+        q["_sha"] = data["sha"]
+        return q
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"_sha": None}  # файла ещё нет — создадим
+        log.warning("GitHub ответил %s, начинаю с чистой очереди", e.code)
+        return {"_sha": None}
     except (urllib.error.URLError, ValueError, KeyError) as e:
-        log.warning("не удалось прочитать состояние (%s), начинаю с чистого", e)
+        log.warning("не удалось прочитать очередь (%s)", e)
         return {"_sha": None}
 
 
-def gh_state_save(state):
+def gh_save(q):
     headers = {
         "Authorization": "token %s" % env("GH_TOKEN"),
         "Accept": "application/vnd.github+json",
     }
-    payload = {"_sha": None}
-    state = dict(state)
-    sha = state.pop("_sha", None)
+    q = dict(q)
+    sha = q.pop("_sha", None)
     payload = {
-        "message": "state: %s" % now().isoformat(timespec="minutes"),
+        "message": "queue: %s МСК" % now().strftime("%F %H:%M"),
         "content": base64.b64encode(
-            json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8")
+            json.dumps(q, ensure_ascii=False, indent=1).encode("utf-8")
         ).decode("ascii"),
     }
     if sha:
         payload["sha"] = sha
     try:
-        Client().put_json(GH_CONTENTS % env("GH_REPO", "ran1k1n/gubkin-pairs"),
+        Client().put_json(QUEUE_URL % env("GH_REPO", "ran1k1n/gubkin-pairs"),
                           payload, headers)
+        return True
     except urllib.error.URLError as e:
-        log.error("не удалось сохранить состояние: %s", e)
+        log.error("не удалось сохранить очередь: %s", e)
+        return False
+
+
+def enqueue(q, msg_id, text):
+    """Кладёт сообщение в очередь, если оно не отправлялось и не лежит уже."""
+    sent = q.setdefault("sent", [])
+    pending = q.setdefault("pending", [])
+    if msg_id in sent or any(m.get("id") == msg_id for m in pending):
+        return False
+    pending.append({"id": msg_id, "text": text})
+    return True
 
 
 # ---------------------------------------------------------------- решение
 
-def decide_and_notify(classes, state):
+def decide_and_notify(classes, q):
     t = now()
     today = t.date().isoformat()
-    if state.get("date") != today:
-        state.update({"date": today, "sent": []})
-    sent = state.setdefault("sent", [])
+    if q.get("date") != today:
+        q.update({"date": today, "sent": [], "pending": []})
     changed = False
 
     summary_dt = t.replace(hour=7, minute=30, second=0, microsecond=0)
-    if summary_dt <= t < summary_dt + timedelta(minutes=60) and "summary" not in sent:
+    if summary_dt <= t < summary_dt + timedelta(minutes=60) and "summary" not in q["sent"]:
         if classes:
             lines = ["Пары на сегодня (%s):" % today]
             lines += ["%s — %s" % (c["start"], format_class(c)) for c in classes]
         else:
             lines = ["Пар сегодня нет — отдыхайте!"]
-        send("Расписание на день\n" + "\n".join(lines))
-        sent.append("summary")
-        changed = True
+        if enqueue(q, "summary", "Расписание на день\n" + "\n".join(lines)):
+            changed = True
 
-    for i, c in enumerate(classes):
+    for c in classes:
         hhmm = parse_hhmm(c["start"])
         if not hhmm:
             continue
         start_dt = t.replace(hour=hhmm[0], minute=hhmm[1], second=0, microsecond=0)
         alert_dt = start_dt - timedelta(minutes=LEAD)
         key = "class:%s:%s" % (today, c["start"])
-        if alert_dt <= t < start_dt + timedelta(minutes=5) and key not in sent:
+        if alert_dt <= t < start_dt + timedelta(minutes=5) and key not in q["sent"]:
             if t >= start_dt:
-                send("Скоро пара\nУже началась (%s): %s" % (c["start"], format_class(c)))
+                text = "Скоро пара\nУже началась (%s): %s" % (c["start"], format_class(c))
             else:
                 left = int((start_dt - t).total_seconds() // 60)
-                send("Скоро пара\nВ %s (через %d мин): %s"
-                     % (c["start"], left, format_class(c)))
-            sent.append(key)
-            changed = True
+                text = "Скоро пара\nВ %s (через %d мин): %s" % (
+                    c["start"], left, format_class(c))
+            if enqueue(q, key, text):
+                changed = True
 
     return changed
 
@@ -283,27 +301,33 @@ def decide_and_notify(classes, state):
 
 def handler(event, context):
     if env("TEST_CONNECTIVITY"):
-        try:
-            req = urllib.request.Request(LKH, method="HEAD")
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                return "lk.gubkin.ru: HTTP %s" % resp.status
-        except urllib.error.HTTPError as e:
-            return "lk.gubkin.ru: HTTP %s (доступен)" % e.code
-        except urllib.error.URLError as e:
-            return "lk.gubkin.ru НЕДОСТУПЕН: %s" % e
+        results = []
+        for host in ("lk.gubkin.ru", "api.github.com", "api.telegram.org"):
+            try:
+                req = urllib.request.Request("https://%s/" % host, method="HEAD")
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                    results.append("%s: HTTP %s" % (host, resp.status))
+            except urllib.error.HTTPError as e:
+                results.append("%s: HTTP %s (доступен)" % (host, e.code))
+            except urllib.error.URLError as e:
+                results.append("%s: НЕДОСТУПЕН (%s)" % (host, e.reason))
+        return "; ".join(results)
     if event and str(event.get("test_push", "")).lower() in ("1", "true"):
-        ok = send("Тест уведомлений (Yandex Cloud)\n"
-                  "Сообщения теперь идут из облака — Mac не нужен.")
-        return "test_push: %s" % ("ok" if ok else "fail")
+        q = gh_load()
+        changed = enqueue(q, "test:%s" % now().strftime("%s"),
+                          "Тест уведомлений (облако)\n"
+                          "Цепочка Яндекс → GitHub → Telegram работает.")
+        saved = gh_save(q) if changed else False
+        return "test_push enqueued: %s, saved: %s" % (changed, saved)
 
-    state = gh_state_load()
+    q = gh_load()
     c = Client()
     if not lk_login(c):
-        if "auth_fail:%s" % now().date() not in state.get("sent", []):
-            send("ЛК Губкина: вход не удался\n"
-                 "Проверьте LK_LOGIN/LK_PASSWORD в настройках функции.")
-            state.setdefault("sent", []).append("auth_fail:%s" % now().date())
-            gh_state_save(state)
+        changed = enqueue(q, "auth_fail:%s" % now().date(),
+                          "ЛК Губкина: вход не удался\n"
+                          "Проверьте LK_LOGIN/LK_PASSWORD в настройках функции.")
+        if changed:
+            gh_save(q)
         return "auth failed"
 
     raw = c.get_json(LKH + TIMETABLE_API)
@@ -315,8 +339,9 @@ def handler(event, context):
 
     log.info("пар сегодня: %d (%s)", len(classes),
              "; ".join(x["start"] for x in classes))
-    if decide_and_notify(classes, state):
-        gh_state_save(state)
+    if decide_and_notify(classes, q):
+        if not gh_save(q):
+            return "queue save failed"
     return "ok: %d classes" % len(classes)
 
 

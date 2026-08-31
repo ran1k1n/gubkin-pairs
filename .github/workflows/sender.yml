@@ -1,0 +1,55 @@
+name: Доставка в Telegram
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sender
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Отправить ожидающие сообщения
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 sender.py
+
+      - name: Зафиксировать очередь
+        run: |
+          git config user.name "gubkin-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "очередь не менялась"
+            exit 0
+          fi
+          for i in 1 2 3; do
+            git add queue.json
+            git commit -m "queue: доставлено $(date -u +%FT%TZ)" || exit 0
+            git pull --rebase origin ${GITHUB_REF_NAME} && git push && exit 0
+            sleep 3
+          done
+          echo "не удалось запушить очередь"
+          exit 1
+
+      - name: Keepalive (защита от отключения расписания через 60 дней)
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          if [ $((NOW - LAST)) -gt 90000 ]; then
+            git commit --allow-empty -m "keepalive $(date +%F)" && git push
+          fi
