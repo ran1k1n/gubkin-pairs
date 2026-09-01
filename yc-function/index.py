@@ -13,7 +13,7 @@ GitHub-репозитория — функция в облаке не имеет
 """
 
 import base64
-import http.cookiejar
+import io
 import json
 import logging
 import os
@@ -23,6 +23,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Сайт проверяет TLS-отпечаток клиента на /schedule/api: обычный python
+# блокируется (тarpit/403). curl_cffi изображает Chrome и проходит.
+try:
+    from curl_cffi import requests as _creq
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
 
 LKH = "https://lk.gubkin.ru/"
 TGH = "https://api.telegram.org/bot%s/sendMessage"
@@ -48,43 +56,102 @@ def now():
 # ---------------------------------------------------------------- HTTP
 
 class Client:
+    """HTTP-клиент: curl_cffi с импersonацией Chrome, urllib как запасной путь."""
+
     def __init__(self):
-        self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar)
-        )
-        self.opener.addheaders = [
-            ("Accept", "application/json"),
-            ("Content-Type", "application/json"),
-            ("User-Agent", "gubkin-yc/1.0"),
-        ]
+        if HAS_CFFI:
+            self.session = _creq.Session(impersonate="chrome")
+        else:
+            import http.cookiejar
+            jar = http.cookiejar.CookieJar()
+            self.opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(jar)
+            )
+            self.opener.addheaders = [
+                ("Accept", "application/json"),
+                ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/128.0.0.0 Safari/537.36"),
+            ]
+
+    def _cffi_call(self, method, url, payload=None, form=None, headers=None):
+        """Вызов через curl_cffi; ошибки приводятся к urllib-совместимым."""
+        try:
+            if method == "GET":
+                r = self.session.get(url, timeout=HTTP_TIMEOUT, headers=headers)
+            elif method == "POST_JSON":
+                h = {"Content-Type": "application/json", "Accept": "application/json"}
+                h.update(headers or {})
+                r = self.session.post(url, timeout=HTTP_TIMEOUT, headers=h,
+                                      data=json.dumps(payload).encode("utf-8"))
+            elif method == "POST_FORM":
+                r = self.session.post(url, timeout=HTTP_TIMEOUT, headers=headers,
+                                      data=urllib.parse.urlencode(form).encode("utf-8"))
+            else:  # PUT_JSON
+                h = {"Content-Type": "application/json"}
+                h.update(headers or {})
+                r = self.session.put(url, timeout=HTTP_TIMEOUT, headers=h,
+                                     data=json.dumps(payload).encode("utf-8"))
+        except Exception as e:
+            raise urllib.error.URLError("curl_cffi: %s" % e)
+        if r.status_code >= 400:
+            raise urllib.error.HTTPError(
+                url, r.status_code, r.reason, {},
+                io.BytesIO(r.content if r.content else b""),
+            )
+        return json.loads(r.text)
+
+    def visit(self, url):
+        """Загружает страницу ради сессии/WAF: без посещения /schedule/
+        API расписания не отвечает (проверено). Тело не парсим."""
+        if HAS_CFFI:
+            try:
+                self.session.get(url, timeout=HTTP_TIMEOUT)
+                return
+            except Exception as e:
+                raise urllib.error.URLError("curl_cffi visit: %s" % e)
+        req = urllib.request.Request(url, method="GET")
+        with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            resp.read(2048)
 
     def post_json(self, url, payload, headers=None):
+        if HAS_CFFI:
+            return self._cffi_call("POST_JSON", url, payload=payload, headers=headers)
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"), method="POST"
         )
+        req.add_header("Content-Type", "application/json")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def get_json(self, url, headers=None):
+        if HAS_CFFI:
+            return self._cffi_call("GET", url, headers=headers)
         req = urllib.request.Request(url, method="GET")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def post_form(self, url, form):
+    def post_form(self, url, form, headers=None):
+        if HAS_CFFI:
+            return self._cffi_call("POST_FORM", url, form=form, headers=headers)
         data = urllib.parse.urlencode(form).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
         with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def put_json(self, url, payload, headers=None):
+        if HAS_CFFI:
+            return self._cffi_call("PUT_JSON", url, payload=payload, headers=headers)
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"), method="PUT"
         )
+        req.add_header("Content-Type", "application/json")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         with self.opener.open(req, timeout=HTTP_TIMEOUT) as resp:
@@ -104,6 +171,14 @@ def lk_login(c):
             LKH + "api/api.php?module=auth&method=login",
             {"login": field, "password": password, "rememberMe": 1},
         )
+    except urllib.error.HTTPError as e:
+        # сайт отдаёт HTTP 500 даже на обычные ошибки вроде неверного пароля
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = "<нет тела>"
+        log.error("вход: HTTP %s, тело: %s", e.code, body)
+        return False
     except urllib.error.URLError as e:
         log.error("ЛК недоступен: %s", e)
         return False
@@ -117,57 +192,56 @@ def lk_login(c):
 TIMETABLE_API = env(
     "TIMETABLE_API", "api/api.php?module=study&method=timetable"
 )
+GROUP_ID = env("GROUP_ID", "10706")
 
 
-# ---------------------------------------------------------------- расписание
+def fetch_schedule(c, day):
+    """Расписание на неделю, содержащую day (datetime); фильтруем по дню.
 
-def parse_hhmm(s):
-    m = re.match(r"^(\d{1,2}):(\d{2})", str(s).strip())
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def parse_timetable(raw):
+    Нюанс: weekDayNumber в ответе — НЕ день недели ISO, а номер дня
+    в учебной неделе университета (учебный год может начинаться со
+    вторника). Соответствие берем из rows.week.weekRussia.days.
+    """
+    c.visit(LKH + "schedule/")  # WAF пускает в API только после «визита»
+    url = ("%sschedule/api/api.php?act=schedule&date=%d-%d-%d&groupId=%s"
+           % (LKH, day.day, day.month, day.year, GROUP_ID))
+    raw = c.get_json(url, headers={"Referer": LKH + "schedule/",
+                                   "Accept": "application/json, text/plain, */*"})
+    rows = raw.get("rows") or {}
+    date_str = day.strftime("%d-%m-%Y")
+    target_day = None
+    for d in (rows.get("week") or {}).get("weekRussia", {}).get("days", []):
+        if d.get("date") == date_str:
+            target_day = d.get("weekDayNumber")
+            break
+    if target_day is None:
+        return []  # дата вне учебной недели (каникулы и т.п.)
     classes = []
-
-    def first(node, keys, *cands):
-        for cand in cands:
-            k = keys.get(cand)
-            if k and node[k]:
-                return str(node[k])
-        return None
-
-    def walk(node):
-        if isinstance(node, dict):
-            keys = {str(k).lower(): str(k) for k in node}
-            start = None
-            for cand in ("start", "starttime", "begintime", "время", "начало",
-                         "time_from", "from", "lessonstart"):
-                if cand in keys:
-                    start = parse_hhmm(node[keys[cand]])
-                    if start:
-                        break
-            subject = first(node, keys, "subject", "discipline", "name",
-                            "title", "предмет", "дисциплина", "lesson",
-                            "lessonname")
-            if start and subject:
-                classes.append({
-                    "start": "%02d:%02d" % start,
-                    "subject": subject,
-                    "room": first(node, keys, "room", "auditory", "place",
-                                  "аудитория", "кабинет", "location"),
-                    "teacher": first(node, keys, "teacher", "lecturer",
-                                     "преподаватель"),
-                    "kind": first(node, keys, "kind", "type", "вид",
-                                  "lessontype"),
-                })
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(raw)
-    classes.sort(key=lambda c: c["start"])
+    for org in rows.get("organizations", []):
+        chunks = org.get("lessonsTimeChunks", [])
+        for l in org.get("lessons", []):
+            if l.get("isCanceled") or l.get("isMoved"):
+                continue
+            if l.get("weekDayNumber") != target_day:
+                continue
+            tc = l.get("timeChunks") or []
+            if not tc or tc[0] >= len(chunks):
+                continue
+            start = chunks[tc[0]].split("-")[0]
+            rooms = ", ".join(
+                r.get("number", "") for r in (l.get("rooms") or []) if r.get("number"))
+            teachers = ", ".join(
+                t["lastName"] for t in (l.get("teachers") or [])
+                if isinstance(t, dict) and t.get("lastName"))
+            classes.append({
+                "start": start,
+                "subject": ((l.get("course") or {}).get("name")
+                            or l.get("type") or "Занятие"),
+                "room": rooms or None,
+                "teacher": teachers or None,
+                "kind": l.get("type"),
+            })
+    classes.sort(key=lambda x: x["start"])
     return classes
 
 
@@ -260,6 +334,11 @@ def enqueue(q, msg_id, text):
 
 # ---------------------------------------------------------------- решение
 
+def parse_hhmm(s):
+    m = re.match(r"^(\d{1,2}):(\d{2})", str(s).strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def decide_and_notify(classes, q):
     t = now()
     today = t.date().isoformat()
@@ -277,13 +356,13 @@ def decide_and_notify(classes, q):
         if enqueue(q, "summary", "Расписание на день\n" + "\n".join(lines)):
             changed = True
 
-    for c in classes:
+    for i, c in enumerate(classes):
         hhmm = parse_hhmm(c["start"])
         if not hhmm:
             continue
         start_dt = t.replace(hour=hhmm[0], minute=hhmm[1], second=0, microsecond=0)
         alert_dt = start_dt - timedelta(minutes=LEAD)
-        key = "class:%s:%s" % (today, c["start"])
+        key = "class:%s:%d:%s" % (today, i, c["start"])
         if alert_dt <= t < start_dt + timedelta(minutes=5) and key not in q["sent"]:
             if t >= start_dt:
                 text = "Скоро пара\nУже началась (%s): %s" % (c["start"], format_class(c))
@@ -312,6 +391,48 @@ def handler(event, context):
             except urllib.error.URLError as e:
                 results.append("%s: НЕДОСТУПЕН (%s)" % (host, e.reason))
         return "; ".join(results)
+    if event and str(event.get("debug", "")).lower() in ("1", "true"):
+        c = Client()
+        info = {"env_login": bool(env("LK_LOGIN")),
+                "env_pass_len": len(env("LK_PASSWORD"))}
+        try:
+            resp = c.post_json(
+                LKH + "api/api.php?module=auth&method=login",
+                {"login": int(env("LK_LOGIN")) if str(env("LK_LOGIN")).isdigit()
+                 else env("LK_LOGIN"),
+                 "password": env("LK_PASSWORD"), "rememberMe": 1},
+            )
+            info["login_response"] = resp
+            if resp.get("success") is True:
+                # проверка доступа к endpoint'ам расписания (нужен «визит»)
+                try:
+                    c.visit(LKH + "schedule/")
+                    info["visit"] = "OK"
+                except Exception as e:
+                    info["visit"] = str(e)[:150]
+                for label, url in (
+                    ("meta", LKH + "schedule/api/api.php?act=meta"),
+                    ("schedule", LKH + "schedule/api/api.php?act=schedule"
+                               "&date=1-9-2026&groupId=10706"),
+                ):
+                    try:
+                        r = c.get_json(url, headers={
+                            "Referer": LKH + "schedule/",
+                            "Accept": "application/json, text/plain, */*"})
+                        info[label] = "OK: " + json.dumps(
+                            r, ensure_ascii=False)[:300]
+                    except urllib.error.HTTPError as e:
+                        info[label] = "HTTP %s: %s" % (
+                            e.code, e.read().decode("utf-8", "replace")[:200])
+                    except urllib.error.URLError as e:
+                        info[label] = "ERR: %s" % str(e)[:200]
+                return json.dumps(info, ensure_ascii=False)
+        except urllib.error.HTTPError as e:
+            info["http_error"] = "%s: %s" % (e.code, e.read().decode("utf-8", "replace")[:500])
+        except urllib.error.URLError as e:
+            info["url_error"] = str(e)
+        return json.dumps(info, ensure_ascii=False)
+
     if event and str(event.get("test_push", "")).lower() in ("1", "true"):
         q = gh_load()
         changed = enqueue(q, "test:%s" % now().strftime("%s"),
@@ -330,15 +451,18 @@ def handler(event, context):
             gh_save(q)
         return "auth failed"
 
-    raw = c.get_json(LKH + TIMETABLE_API)
-    classes = parse_timetable(raw)
-    if not classes:
-        log.info("пары не распознаны, структура: %s",
-                 json.dumps(_shape(raw), ensure_ascii=False)[:1500])
-        return "no classes parsed"
+    try:
+        classes = fetch_schedule(c, now())
+    except urllib.error.HTTPError as e:
+        log.error("расписание: HTTP %s, тело: %s",
+                  e.code, e.read().decode("utf-8", "replace")[:300])
+        return "schedule http error"
+    except urllib.error.URLError as e:
+        log.error("расписание недоступно: %s", e)
+        return "schedule unreachable"
 
     log.info("пар сегодня: %d (%s)", len(classes),
-             "; ".join(x["start"] for x in classes))
+             "; ".join(x["start"] + " " + x["subject"] for x in classes))
     if decide_and_notify(classes, q):
         if not gh_save(q):
             return "queue save failed"
