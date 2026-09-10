@@ -455,9 +455,9 @@ def tg(api_method, token, files=None, **params):
     до таймаута). files: {поле: (filename, bytes)} — multipart-выгрузка."""
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
     long_poll = api_method == "getUpdates"
-    cmd = ["curl", "-s", "--connect-timeout", "8",
-           "--max-time", "45" if long_poll else "25",
-           "--retry", "2", "--retry-all-errors"]
+    cmd = ["curl", "-s", "--connect-timeout", "4",
+           "--max-time", "45" if long_poll else "15",
+           "--retry", "1", "--retry-all-errors"]
     if files:
         import tempfile
         tmps = []
