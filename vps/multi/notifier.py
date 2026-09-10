@@ -67,6 +67,17 @@ def main():
     sent = load_sent()
     today_key = today.isoformat()
 
+    # напоминание об оплате сервера (владельцу, раз в месяц)
+    rent_day = int(CFG.get("rent_reminder_day", 1))
+    rkey = "rent:%s" % today_key[:7]
+    if (t.day == rent_day and t.hour >= 10 and rkey not in sent
+            and CFG.get("admin_chat_id")):
+        sent[rkey] = 1
+        sender.send(int(CFG["admin_chat_id"]),
+                    "💳 Напоминание: сегодня пора оплатить аренду сервера "
+                    "Aeza (~100–150₽). Пополните баланс в панели aeza.net, "
+                    "чтобы напоминания о парах не остановились.")
+
     for gid, info in groups.items():
         chats = info["chats"]
         gname = info["name"]
