@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    Backoff, CACHE_DIR, Sender, classes_on_date, db, get_week, hhmm,
+    Backoff, CaptchaNeeded, CACHE_DIR, Sender, classes_on_date, db, get_week, hhmm,
     lessons_text, load_config, now, users_by_group, day_label)
 
 SENT_PATH = CACHE_DIR / "sent.json"
@@ -87,8 +87,21 @@ def main():
             week = get_week(gid,
                             force=need_refresh,
                             max_age_min=None if need_refresh else REFRESH_MIN)
+        except CaptchaNeeded:
+            ckey = "captcha_asked:%s" % today_key
+            if ckey not in sent:
+                sent[ckey] = 1
+                all_chats = [c for info in groups.values()
+                             for c in info["chats"]]
+                sender.broadcast(all_chats,
+                                 "🔒 Сайт университета просит капчу — "
+                                 "уведомления приостановлены.\n"
+                                 "Отправьте боту /unlock и введите код с "
+                                 "картинки — всё оживёт.")
+            log.warning("группа %s: нужна капча", gid)
+            continue
         except Backoff:
-            log.warning("группа %s: сайт ограничивает, пропуск", gid)
+            log.warning("группа %s: сайт недоступен, пропуск", gid)
             continue
         except Exception as e:
             log.error("группа %s: %s", gid, e)

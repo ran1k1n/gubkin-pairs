@@ -11,7 +11,8 @@ from datetime import timedelta
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    Backoff, SchedClient, add_user, db, del_user, day_label, get_user,
+    Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
+    day_label, get_user,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
 
 log = logging.getLogger("gubkin-bot")
@@ -159,9 +160,13 @@ def kb_groups(fid):
 def send_week_preview(send, chat_id, group_id, group_name):
     try:
         week = get_week(group_id, max_age_min=30)
+    except CaptchaNeeded:
+        send(chat_id, "🔒 Сайт университета просит подтверждение — "
+                      "решите капчу, это займёт 20 секунд:")
+        cmd_unlock(send, chat_id)
+        return
     except Backoff:
-        send(chat_id, "⏳ Сайт университета временно ограничивает запросы — "
-                      "попробуйте через полчаса.")
+        send(chat_id, "⏳ Сайт университета недоступен — попробуйте позже.")
         return
     t = now()
     today_les = classes_for(week, t)
@@ -260,8 +265,12 @@ def handle_message(send, conn, msg):
     elif text.startswith("/tomorrow") and user:
         try:
             week = get_week(user[2], max_age_min=30)
+        except CaptchaNeeded:
+            send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
+            cmd_unlock(send, chat_id)
+            return
         except Backoff:
-            send(chat_id, "⏳ Сайт ограничивает запросы — попробуйте позже.")
+            send(chat_id, "⏳ Сайт недоступен — попробуйте позже.")
             return
         d = now() + timedelta(days=1)
         send(chat_id, lessons_text(classes_for(week, d),
@@ -269,8 +278,12 @@ def handle_message(send, conn, msg):
     elif text.startswith("/week") and user:
         try:
             week = get_week(user[2], max_age_min=60)
+        except CaptchaNeeded:
+            send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
+            cmd_unlock(send, chat_id)
+            return
         except Backoff:
-            send(chat_id, "⏳ Сайт ограничивает запросы — попробуйте позже.")
+            send(chat_id, "⏳ Сайт недоступен — попробуйте позже.")
             return
         days = sorted({l["wd"] for l in week.get("lessons", [])
                        if not l.get("cancelled")})

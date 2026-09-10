@@ -190,7 +190,11 @@ def backoff_clear():
 
 
 class Backoff(Exception):
-    pass
+    """Сайт недоступен/ошибка сети — повторить позже."""
+
+
+class CaptchaNeeded(Exception):
+    """Сайт ответил 429 «введите капчу» — нужен человек с /unlock."""
 
 
 def _norm_week(raw, group_id):
@@ -282,7 +286,7 @@ def get_week(group_id, max_age_min=None, force=False):
             log.warning("429, пауза %d мин", wait)
             if cache and same_week:
                 return cache
-            raise Backoff()
+            raise CaptchaNeeded()
         raise
     except (urllib.error.URLError, ValueError, OSError) as e:
         log.warning("сеть: %s", e)
