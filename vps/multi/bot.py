@@ -163,7 +163,7 @@ def kb_groups(fid):
 
 def send_week_preview(send, chat_id, group_id, group_name):
     try:
-        week = get_week(group_id, max_age_min=30)
+        week = get_week(group_id, max_age_min=None)
     except CaptchaNeeded:
         if auto_captcha_allow():
             send(chat_id, "🔒 Сайт университета просит подтверждение — "
@@ -352,7 +352,7 @@ def handle_message(send, conn, msg):
         send_week_preview(send, chat_id, user[2], user[3])
     elif text.startswith("/tomorrow") and user:
         try:
-            week = get_week(user[2], max_age_min=30)
+            week = get_week(user[2], max_age_min=None)
         except CaptchaNeeded:
             if auto_captcha_allow():
                 send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
@@ -369,7 +369,7 @@ def handle_message(send, conn, msg):
                                    "📅 Завтра, %s" % day_label(d)))
     elif text.startswith("/week") and user:
         try:
-            week = get_week(user[2], max_age_min=60)
+            week = get_week(user[2], max_age_min=None)
         except CaptchaNeeded:
             if auto_captcha_allow():
                 send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
