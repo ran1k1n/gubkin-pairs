@@ -418,6 +418,25 @@ def get_week(group_id, max_age_min=None, force=False):
     return data
 
 
+def needs_refresh(gid, max_age_min=None):
+    """True, если следующий get_week пойдёт в сеть (кэша нет/устарел) —
+    боты используют, чтобы предупредить пользователя о загрузке."""
+    cache = load_sched(gid)
+    if not cache:
+        return True
+    try:
+        fdt = datetime.fromisoformat(cache.get("fetched_at", ""))
+    except ValueError:
+        return True
+    same_week = any(d.get("date") == now().strftime("%d-%m-%Y")
+                    for d in cache.get("week_days", []))
+    if not same_week:
+        return True
+    if max_age_min is not None:
+        return (now() - fdt) > timedelta(minutes=max_age_min)
+    return fdt.date() != now().date()
+
+
 def classes_on_date(week, day):
     """Занятия на дату (datetime) из нормализованной недели."""
     date_str = day.strftime("%d-%m-%Y")

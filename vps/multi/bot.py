@@ -13,7 +13,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
     auto_captcha_allow, day_label, get_user, manual_unlock_allow,
-    pending_clear,
+    needs_refresh, pending_clear,
     pending_is, pending_set,
     set_enabled, users_all,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
@@ -162,6 +162,8 @@ def kb_groups(fid):
 
 
 def send_week_preview(send, chat_id, group_id, group_name):
+    if needs_refresh(group_id):
+        send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
     try:
         week = get_week(group_id, max_age_min=None)
     except CaptchaNeeded:
@@ -351,6 +353,8 @@ def handle_message(send, conn, msg):
     elif text.startswith("/today") and user:
         send_week_preview(send, chat_id, user[2], user[3])
     elif text.startswith("/tomorrow") and user:
+        if needs_refresh(user[2]):
+            send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
         try:
             week = get_week(user[2], max_age_min=None)
         except CaptchaNeeded:
@@ -368,6 +372,8 @@ def handle_message(send, conn, msg):
         send(chat_id, lessons_text(classes_for(week, d),
                                    "📅 Завтра, %s" % day_label(d)))
     elif text.startswith("/week") and user:
+        if needs_refresh(user[2]):
+            send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
         try:
             week = get_week(user[2], max_age_min=None)
         except CaptchaNeeded:
