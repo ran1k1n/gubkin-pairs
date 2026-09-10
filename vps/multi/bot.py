@@ -73,15 +73,28 @@ WELCOME = (
     "Выберите факультет кнопкой ниже 👇"
 )
 
-HELP = (
-    "Команды:\n"
+PIN_CARD = (
+    "📌 Бот расписания Губкинского\n\n"
     "/today — пары на сегодня\n"
     "/tomorrow — пары на завтра\n"
-    "/week — неделя\n"
+    "/week — расписание на неделю\n"
     "/group — сменить группу\n"
     "/stop — отписаться\n\n"
-    "Утренняя сводка приходит в 07:30, напоминание — за 15 минут до пары."
+    "🌅 Утром в 07:30 — сводка на день\n"
+    "🔔 За 15 минут до пары — напоминание\n"
+    "❌ Об отмене сообщу сразу"
 )
+
+BOT_COMMANDS = [
+    {"command": "start", "description": "Подключиться и выбрать группу"},
+    {"command": "today", "description": "Пары на сегодня"},
+    {"command": "tomorrow", "description": "Пары на завтра"},
+    {"command": "week", "description": "Расписание на неделю"},
+    {"command": "group", "description": "Сменить группу"},
+    {"command": "stop", "description": "Отписаться от уведомлений"},
+]
+
+HELP = PIN_CARD.replace("📌 ", "") + "\n\nНажмите /start для подключения."
 
 
 def keyboard(rows_per=2):
@@ -243,7 +256,15 @@ def handle_callback(send, conn, cb):
                  chat_id, gid, code)
         send(chat_id, "✅ Группа %s сохранена!\n\n"
                       "Утром в 07:30 пришлю пары на день, за 15 минут до "
-                      "пары — напомню.\n\n%s" % (code, HELP))
+                      "пары — напомню." % code)
+        # карточка-подсказка, закрепляется в чате нового пользователя
+        card = send(chat_id, PIN_CARD)
+        if card and card.get("message_id"):
+            try:
+                tg("pinChatMessage", TOKEN, chat_id=chat_id,
+                   message_id=card["message_id"])
+            except Exception as e:
+                log.warning("pin не удался: %s", e)
         send_week_preview(send, chat_id, gid, code)
 
 
@@ -271,11 +292,18 @@ def main():
             params["reply_markup"] = reply_markup
         for attempt in range(3):
             try:
-                tg("sendMessage", TOKEN, **params)
-                return
+                return tg("sendMessage", TOKEN, **params)
             except Exception as e:
                 log.warning("sendMessage: %s (попытка %d)", e, attempt + 1)
                 time.sleep(2)
+
+    # меню команд с подсказками — действует на всех пользователей,
+    # текущих и будущих (Telegram показывает его в кнопке «Меню»)
+    try:
+        tg("setMyCommands", TOKEN, commands=BOT_COMMANDS)
+        log.info("меню команд установлено")
+    except Exception as e:
+        log.warning("setMyCommands: %s", e)
 
     log.info("бот запущен, offset=%d", offset)
     while True:
