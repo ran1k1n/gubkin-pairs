@@ -223,8 +223,14 @@ def load_state():
     except (OSError, ValueError):
         state = {}
     if state.get("date") != today:
-        state = {"date": today, "sent": []}
+        state = {"date": today, "sent": [], "classes": None}
+    state.setdefault("sent", [])
     return state
+
+
+def save_state(state):
+    STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def parse_hhmm(s):
@@ -315,28 +321,57 @@ def main():
                      "Система работает независимо от вашего Mac.")
         return 0 if ok else 1
 
-    client = LkClient()
-    if not client.login(CFG["lk_login"], CFG["lk_password"]):
-        state = load_state()
-        if "auth_fail" not in state.get("sent", []):
-            deliver(CFG, "auth_fail:%s" % now().date(),
-                    "ЛК Губкина: вход не удался\n"
-                    "Проверьте логин/пароль в /opt/gubkin/config.json.")
-            state.setdefault("sent", []).append("auth_fail")
-            STATE_PATH.write_text(
-                json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        return 2
+    state = load_state()
 
-    try:
-        classes = client.schedule_for(now())
-    except (urllib.error.URLError, ValueError, OSError) as e:
-        log.error("расписание не получено: %s", e)
-        return 3
+    # Расписание читается ОДИН раз в день и кэшируется в state.json:
+    # университет ограничивает частоту запросов (429), поэтому все
+    # решения о напоминаниях принимаются локально, без обращений к сайту.
+    classes = state.get("classes")
+    if classes is None:
+        # при активном бане 429 не дёргаем сайт каждые 5 минут —
+        # ждём с нарастающим интервалом (30 мин → 1 ч → 2 ч → … cap 6 ч)
+        nf = state.get("next_fetch_after")
+        if nf:
+            try:
+                if now() < datetime.fromisoformat(nf):
+                    return 0
+            except ValueError:
+                pass
+        client = LkClient()
+        if not client.login(CFG["lk_login"], CFG["lk_password"]):
+            if "auth_fail" not in state["sent"]:
+                deliver(CFG, "auth_fail", "ЛК Губкина: вход не удался\n"
+                        "Проверьте логин/пароль в /opt/gubkin/config.json.")
+                state["sent"].append("auth_fail")
+                save_state(state)
+            return 2
+        try:
+            classes = client.schedule_for(now())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                tries = state.get("rate_limit_tries", 0) + 1
+                wait = min(30 * 2 ** (tries - 1), 360)
+                state["next_fetch_after"] = (
+                    now() + timedelta(minutes=wait)).isoformat()
+                state["rate_limit_tries"] = tries
+                save_state(state)
+                log.warning("сайт ограничил частоту (429), попытка %d — "
+                            "следующая через %d мин", tries, wait)
+                return 4
+            log.error("расписание: HTTP %s", e.code)
+            return 3
+        except (urllib.error.URLError, ValueError, OSError) as e:
+            log.error("расписание не получено: %s", e)
+            return 3
+        state["classes"] = classes
+        state.pop("next_fetch_after", None)
+        state.pop("rate_limit_tries", None)
+        save_state(state)
+        log.info("расписание на день закэшировано: пар %d%s", len(classes),
+                 ": " + "; ".join("%s %s" % (c["start"], c["subject"])
+                                  for c in classes) if classes else "")
 
-    log.info("пар сегодня: %d%s", len(classes),
-             ": " + "; ".join("%s %s" % (c["start"], c["subject"])
-                              for c in classes) if classes else "")
-    decide_and_deliver(CFG, classes, load_state())
+    decide_and_deliver(CFG, classes, state)
     return 0
 
 
