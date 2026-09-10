@@ -27,7 +27,8 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 LKH = "https://lk.gubkin.ru/"
 TZ = ZoneInfo("Europe/Moscow")
-HTTP_TIMEOUT = 40
+HTTP_TIMEOUT = 40   # telegram/github
+SITE_TIMEOUT = 12   # lk.gubkin.ru: нормально отвечает за 0.1с; тarpit отвалится за 12с
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
@@ -135,7 +136,7 @@ class SchedClient:
         except OSError as e:
             log.warning("не сохранить cookies: %s", e)
 
-    def _get(self, path, timeout=HTTP_TIMEOUT):
+    def _get(self, path, timeout=SITE_TIMEOUT):
         req = urllib.request.Request(LKH + path)
         with self.opener.open(req, timeout=timeout) as resp:
             data = resp.read()
@@ -150,14 +151,14 @@ class SchedClient:
         self._get("schedule/")
         self._save()
 
-    def api(self, path, timeout=HTTP_TIMEOUT):
+    def api(self, path, timeout=SITE_TIMEOUT):
         return json.loads(self._get(path, timeout).decode("utf-8", "replace"))
 
-    def raw(self, path, timeout=HTTP_TIMEOUT):
+    def raw(self, path, timeout=SITE_TIMEOUT):
         """Бинарный ответ (например, картинка капчи)."""
         return self._get(path, timeout)
 
-    def post_json(self, path, payload, timeout=HTTP_TIMEOUT):
+    def post_json(self, path, payload, timeout=SITE_TIMEOUT):
         req = urllib.request.Request(LKH + path, method="POST")
         req.data = json.dumps(payload).encode("utf-8")
         req.add_header("Content-Type", "application/json")
@@ -389,13 +390,19 @@ def get_week(group_id, max_age_min=None, force=False):
         raw = c.api("schedule/api/api.php?act=schedule&date=%d-%d-%d&groupId=%s"
                     % (now().day, now().month, now().year, group_id))
     except urllib.error.HTTPError as e:
+        # 429 — просит капчу; 418/403/5xx — WAF-бан или сбой: любой враждебный
+        # ответ означаем как «сайт недоступен», но кэш отдаём мгновенно
         if e.code == 429:
             wait = backoff_register()
             log.warning("429, пауза %d мин", wait)
             if cache and same_week:
                 return cache
             raise CaptchaNeeded()
-        raise
+        log.warning("сайт ответил HTTP %s — считаю недоступным", e.code)
+        backoff_register()
+        if cache and same_week:
+            return cache
+        raise Backoff()
     except (urllib.error.URLError, ValueError, OSError) as e:
         log.warning("сеть: %s", e)
         if cache and same_week:
