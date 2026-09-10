@@ -284,6 +284,27 @@ def auto_captcha_allow(max_per_day=AUTO_CAPTCHA_LIMIT):
     return True
 
 
+MANUAL_UNLOCK_PATH = CACHE_DIR / "manual_unlock.json"
+MANUAL_UNLOCK_LIMIT = 15
+
+
+def manual_unlock_allow(max_per_day=MANUAL_UNLOCK_LIMIT):
+    """True, если ручных /unlock сегодня меньше 15 (и учитывает попытку)."""
+    try:
+        st = json.loads(MANUAL_UNLOCK_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    today = now().date().isoformat()
+    if st.get("date") != today:
+        st = {"date": today, "count": 0}
+    if st["count"] >= max_per_day:
+        MANUAL_UNLOCK_PATH.write_text(json.dumps(st), encoding="utf-8")
+        return False
+    st["count"] += 1
+    MANUAL_UNLOCK_PATH.write_text(json.dumps(st), encoding="utf-8")
+    return True
+
+
 def _norm_week(raw, group_id):
     """Сырой ответ act=schedule -> {week_days, lessons} (нормализовано)."""
     rows = raw.get("rows") or {}

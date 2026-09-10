@@ -12,7 +12,8 @@ from datetime import timedelta
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
-    auto_captcha_allow, day_label, get_user, pending_clear,
+    auto_captcha_allow, day_label, get_user, manual_unlock_allow,
+    pending_clear,
     pending_is, pending_set,
     set_enabled, users_all,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
@@ -163,7 +164,7 @@ def send_week_preview(send, chat_id, group_id, group_name):
         if auto_captcha_allow():
             send(chat_id, "🔒 Сайт университета просит подтверждение — "
                           "решите капчу, это займёт 20 секунд:")
-            cmd_unlock(send, chat_id)
+            cmd_unlock(send, chat_id, manual=False)
         else:
             send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
                           "исчерпан — отправьте /unlock вручную.")
@@ -193,8 +194,13 @@ def send_photo(chat_id, img_bytes, caption):
         return False
 
 
-def cmd_unlock(send, chat_id):
-    """Показать капчу университета и дождаться кода от пользователя."""
+def cmd_unlock(send, chat_id, manual=True):
+    """Показать капчу университета и дождаться кода от пользователя.
+    Ручные вызовы ограничены 15 раз в сутки, авто — своим лимитом (3)."""
+    if manual and not manual_unlock_allow():
+        send(chat_id, "Ручная разблокировка: лимит 15 раз в день исчерпан. "
+                      "Попробуйте завтра.")
+        return
     try:
         c = SchedClient()
         c.visit()
@@ -325,7 +331,7 @@ def handle_message(send, conn, msg):
         except CaptchaNeeded:
             if auto_captcha_allow():
                 send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
-                cmd_unlock(send, chat_id)
+                cmd_unlock(send, chat_id, manual=False)
             else:
                 send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
                               "исчерпан — отправьте /unlock вручную.")
@@ -342,7 +348,7 @@ def handle_message(send, conn, msg):
         except CaptchaNeeded:
             if auto_captcha_allow():
                 send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
-                cmd_unlock(send, chat_id)
+                cmd_unlock(send, chat_id, manual=False)
             else:
                 send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
                               "исчерпан — отправьте /unlock вручную.")
