@@ -20,6 +20,9 @@ from common import (  # noqa: E402
 
 log = logging.getLogger("gubkin-bot")
 
+# чаты, находящиеся в режиме переписки с поддержкой
+SUPPORT_MODE = set()
+
 META_FACULTIES = CACHE_DIR / "meta_faculties.json"
 META_TTL = 604800  # 7 дней: справочники почти не меняются
 
@@ -93,7 +96,8 @@ PIN_CARD = (
     "/today — на сегодня • /tomorrow — на завтра\n"
     "/week — на неделю\n"
     "/start — выбрать группу • /group — сменить\n"
-    "/stop — отписаться\n\n"
+    "/stop — отписаться\n"
+    "/support — написать в поддержку\n\n"
     "🔧 Если сайт ограничивает запросы:\n"
     "пришлю капчу автоматически — просто введите код\n"
     "(неверный код — не страшно, пришлю следующую)\n"
@@ -315,6 +319,24 @@ def handle_message(send, conn, msg):
         check_captcha_answer(send, conn, chat_id, text)
         return
 
+    # режим поддержки: пересылаем админу всё, включая фото и документы
+    if chat_id in SUPPORT_MODE:
+        if text.startswith("/cancel"):
+            SUPPORT_MODE.discard(chat_id)
+            send(chat_id, "Режим поддержки закрыт.")
+            return
+        who = "@" + user[1] if user and user[1] else str(chat_id)
+        send(CFG["admin_chat_id"],
+             "📨 Сообщение в поддержку от %s (id %s):" % (who, chat_id))
+        try:
+            tg("forwardMessage", TOKEN, chat_id=CFG["admin_chat_id"],
+               from_chat_id=chat_id, message_id=msg["message_id"])
+        except Exception as e:
+            log.warning("forwardMessage: %s", e)
+        send(chat_id, "✅ Передано в поддержку. Ответ придёт сюда.\n"
+                      "Выйти из режима: /cancel")
+        return
+
     if text.startswith("/start"):
         if user:
             send(chat_id, "Вы уже подписаны на группу %s.\n\n%s"
@@ -386,6 +408,26 @@ def handle_message(send, conn, msg):
             send(chat_id, "⏳ Сайт университета не отвечает, попробуйте позже.")
     elif text.startswith("/unlock"):
         cmd_unlock(send, chat_id)
+    elif text.startswith("/support"):
+        if is_admin(chat_id):
+            send(chat_id, "Вы и есть поддержка 🙂 Чтобы ответить участнику: "
+                          "/reply <id> <текст>")
+        else:
+            SUPPORT_MODE.add(chat_id)
+            send(chat_id, "✉️ Режим поддержки включён: напишите ваше "
+                          "сообщение, я передам его администратору, ответ "
+                          "придёт сюда.\nВыйти из режима: /cancel")
+    elif text.startswith("/reply"):
+        if is_admin(chat_id):
+            rest = text[len("/reply"):].strip()
+            target, _, msg_text = rest.partition(" ")
+            if target.isdigit() and msg_text:
+                send(int(target), "💬 Ответ поддержки:\n" + msg_text)
+                send(chat_id, "Отправлено.")
+            else:
+                send(chat_id, "Формат: /reply <id> <текст>")
+        else:
+            send(chat_id, "Эта команда только для владельца бота.")
     elif text.startswith("/admin"):
         if is_admin(chat_id):
             text_panel, kb = render_panel(conn)
