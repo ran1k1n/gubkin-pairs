@@ -20,8 +20,11 @@ log = logging.getLogger("gubkin-bot")
 PENDING_CAPTCHA = {}
 
 META_FACULTIES = CACHE_DIR / "meta_faculties.json"
-META_GROUPS = CACHE_DIR / "meta_groups_%s.json"
 META_TTL = 86400  # сутки
+
+
+def meta_groups_path(fid):
+    return CACHE_DIR / ("meta_groups_%s.json" % fid)
 
 
 def cached_json(path):
@@ -53,7 +56,7 @@ def faculties():
 
 
 def faculty_groups(fid):
-    path = META_GROUPS % fid
+    path = meta_groups_path(fid)
     data = cached_json(path)
     if data:
         return data
