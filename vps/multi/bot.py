@@ -224,8 +224,9 @@ def check_captcha_answer(send, conn, chat_id, code):
             "schedule/api/api.php?act=Captcha&method=validateCaptcha",
             {"key": code.strip()})
     except Exception as e:
-        send(chat_id, "Ошибка проверки: %s. Попробуйте ещё раз: /unlock" % e)
-        pending_clear(chat_id)
+        # сеть дрогнула — капча не потрачена, просто вводим код заново
+        send(chat_id, "⚠️ Не удалось проверить код (%s). Введите его ещё раз."
+             % str(e)[:80])
         return
     if resp.get("state") is True:
         pending_clear()  # капча снята — всем больше не нужно отвечать
@@ -244,8 +245,10 @@ def check_captcha_answer(send, conn, chat_id, code):
             send(chat_id, "Капча принята, но при проверке расписания вышла "
                           "ошибка: %s. Она попробует сама позже." % e)
     else:
-        send(chat_id, "❌ Код не подошёл. Вот новая картинка:")
-        cmd_unlock(send, chat_id)
+        # неверный код: показываем следующую капчу, пока не введёт верно;
+        # повторные показы дневной лимит /unlock не тратят
+        send(chat_id, "❌ Код не подошёл — попробуйте ещё раз:")
+        cmd_unlock(send, chat_id, manual=False)
 
 
 
