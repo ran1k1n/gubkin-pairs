@@ -1,0 +1,373 @@
+# -*- coding: utf-8 -*-
+"""Общий код многопользовательского бота расписания Губкинского.
+
+Расписание группы — публичные данные: логин в ЛК не нужен, достаточно
+GET страницы /schedule/ той же сессией перед обращением к API (иначе WAF).
+"""
+
+import http.cookiejar
+import json
+import logging
+import re
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+BASE = Path(__file__).resolve().parent
+CACHE_DIR = BASE / "cache"
+DB_PATH = BASE / "users.db"
+CONFIG_PATH = BASE / "config.json"
+CACHE_DIR.mkdir(exist_ok=True)
+
+LKH = "https://lk.gubkin.ru/"
+TZ = ZoneInfo("Europe/Moscow")
+HTTP_TIMEOUT = 40
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+log = logging.getLogger("gubkin-multi")
+
+
+def now():
+    return datetime.now(TZ)
+
+
+def load_config():
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------- база
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS users(
+        chat_id INTEGER PRIMARY KEY,
+        username TEXT,
+        group_id INTEGER NOT NULL,
+        group_name TEXT NOT NULL,
+        created_at TEXT NOT NULL)""")
+    return conn
+
+
+def add_user(conn, chat_id, username, group_id, group_name):
+    conn.execute(
+        "INSERT OR REPLACE INTO users VALUES (?,?,?,?,?)",
+        (chat_id, username, group_id, group_name, now().isoformat()))
+    conn.commit()
+
+
+def del_user(conn, chat_id):
+    conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
+    conn.commit()
+
+
+def get_user(conn, chat_id):
+    row = conn.execute(
+        "SELECT chat_id,username,group_id,group_name FROM users WHERE chat_id=?",
+        (chat_id,)).fetchone()
+    return row
+
+
+def users_by_group(conn):
+    out = {}
+    for chat_id, _u, gid, gname in conn.execute(
+            "SELECT chat_id,username,group_id,group_name FROM users"):
+        out.setdefault(gid, {"name": gname, "chats": []})["chats"].append(chat_id)
+    return out
+
+
+# ---------------------------------------------------------------- http
+
+class SchedClient:
+    """Публичный клиент расписания (без логина). Помнит WAF-сессию."""
+
+    def __init__(self):
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+        self.opener.addheaders = [("User-Agent", UA),
+                                  ("Accept", "application/json, text/plain, */*")]
+
+    def _get(self, path, timeout=HTTP_TIMEOUT):
+        req = urllib.request.Request(LKH + path)
+        with self.opener.open(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", "replace")
+
+    def visit(self):
+        self._get("schedule/")
+
+    def api(self, path, timeout=HTTP_TIMEOUT):
+        return json.loads(self._get(path, timeout))
+
+
+# ---------------------------------------------------------------- кэш
+
+FETCH_STATE = CACHE_DIR / "fetch_state.json"
+
+
+def fetch_state():
+    try:
+        return json.loads(FETCH_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"next_ok": None, "tries": 0}
+
+
+def fetch_state_save(st):
+    FETCH_STATE.write_text(json.dumps(st), encoding="utf-8")
+
+
+def backoff_active():
+    st = fetch_state()
+    nk = st.get("next_ok")
+    if not nk:
+        return False
+    try:
+        return now() < datetime.fromisoformat(nk)
+    except ValueError:
+        return False
+
+
+def backoff_register():
+    st = fetch_state()
+    st["tries"] = st.get("tries", 0) + 1
+    wait = min(30 * 2 ** (st["tries"] - 1), 360)
+    st["next_ok"] = (now() + timedelta(minutes=wait)).isoformat()
+    fetch_state_save(st)
+    return wait
+
+
+def backoff_clear():
+    st = fetch_state()
+    if st.get("tries") or st.get("next_ok"):
+        fetch_state_save({"next_ok": None, "tries": 0})
+
+
+class Backoff(Exception):
+    pass
+
+
+def _norm_week(raw, group_id):
+    """Сырой ответ act=schedule -> {week_days, lessons} (нормализовано)."""
+    rows = raw.get("rows") or {}
+    week_days = (rows.get("week") or {}).get("weekRussia", {}).get("days", [])
+    lessons = []
+    for org in rows.get("organizations", []):
+        chunks = org.get("lessonsTimeChunks", [])
+        for l in org.get("lessons", []):
+            gids = [g.get("id") for g in (l.get("groups") or [])]
+            if group_id not in gids:
+                continue
+            tc = l.get("timeChunks") or []
+            if not tc or tc[0] >= len(chunks):
+                continue
+            times = chunks[tc[0]].split("-")[0], chunks[tc[-1]].split("-")[-1]
+            rooms = ", ".join(r.get("number", "")
+                              for r in (l.get("rooms") or []) if r.get("number"))
+            teachers = ", ".join(
+                t["lastName"] for t in (l.get("teachers") or [])
+                if isinstance(t, dict) and t.get("lastName"))
+            changes = l.get("changes") or []
+            lessons.append({
+                "wd": l.get("weekDayNumber"),
+                "start": times[0], "end": times[1],
+                "subject": (l.get("course") or {}).get("name") or l.get("type") or "Занятие",
+                "kind": l.get("type"),
+                "room": rooms or None,
+                "teacher": teachers or None,
+                "cancelled": bool(l.get("isCanceled")),
+                "moved": bool(l.get("isMoved")),
+                "changed": bool(changes),
+            })
+    lessons.sort(key=lambda x: (x["wd"], x["start"]))
+    return {"week_days": week_days, "lessons": lessons}
+
+
+def sched_cache_path(gid):
+    return CACHE_DIR / ("sched_%s.json" % gid)
+
+
+def load_sched(gid):
+    try:
+        return json.loads(sched_cache_path(gid).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def save_sched(gid, data):
+    sched_cache_path(gid).write_text(
+        json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def get_week(group_id, max_age_min=None, force=False):
+    """Неделя группы из кэша; при необходимости — из сети.
+
+    max_age_min: если кэш старше — обновить (None = только сегодня).
+    Бросает Backoff, если сайт ограничивает и свежего кэша нет.
+    """
+    cache = load_sched(group_id)
+    same_week = False
+    fresh = False
+    if cache:
+        fetched = cache.get("fetched_at", "")
+        try:
+            fdt = datetime.fromisoformat(fetched)
+            age = now() - fdt
+            fresh = age <= timedelta(minutes=max_age_min or 0)
+            same_week = any(d.get("date") == now().strftime("%d-%m-%Y")
+                            for d in cache.get("week_days", []))
+        except ValueError:
+            pass
+    if cache and not force and (fresh or (same_week and max_age_min is None
+                                          and fetched[:10] == now().date().isoformat())):
+        return cache
+    if backoff_active():
+        if cache and same_week:
+            return cache  # устаревший, но лучше, чем ничего
+        raise Backoff()
+    c = SchedClient()
+    try:
+        c.visit()
+        raw = c.api("schedule/api/api.php?act=schedule&date=%d-%d-%d&groupId=%s"
+                    % (now().day, now().month, now().year, group_id))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            wait = backoff_register()
+            log.warning("429, пауза %d мин", wait)
+            if cache and same_week:
+                return cache
+            raise Backoff()
+        raise
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        log.warning("сеть: %s", e)
+        if cache and same_week:
+            return cache
+        raise Backoff()
+    backoff_clear()
+    prev = cache if (cache and same_week) else None
+    data = {"fetched_at": now().isoformat(), "group_id": group_id}
+    data.update(_norm_week(raw, group_id))
+    if prev:
+        data["prev_lessons"] = prev.get("lessons", [])
+    save_sched(group_id, data)
+    return data
+
+
+def classes_on_date(week, day):
+    """Занятия на дату (datetime) из нормализованной недели."""
+    date_str = day.strftime("%d-%m-%Y")
+    wd = None
+    for d in week.get("week_days", []):
+        if d.get("date") == date_str:
+            wd = d.get("weekDayNumber")
+            break
+    if wd is None:
+        return []
+    return [l for l in week.get("lessons", []) if l.get("wd") == wd]
+
+
+def format_class(c, with_time=True):
+    parts = []
+    if with_time:
+        parts.append("%s–%s" % (c["start"], c["end"]))
+    title = c["subject"] + (" (%s)" % c["kind"] if c.get("kind") else "")
+    parts.append(title)
+    extra = []
+    if c.get("room"):
+        extra.append("ауд. " + c["room"])
+    if c.get("teacher"):
+        extra.append(c["teacher"])
+    if extra:
+        parts.append(", ".join(extra))
+    return " — ".join(parts[:2]) + ((" | " + ", ".join(extra)) if extra else "")
+
+
+# ---------------------------------------------------------------- telegram
+
+def tg(api_method, token, **params):
+    url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
+    data = json.dumps(params).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        body = json.loads(resp.read().decode())
+    if body.get("ok") is not True:
+        raise RuntimeError("telegram %s: %s" % (api_method, body))
+    return body.get("result")
+
+
+class Sender:
+    """Отправка с локальным очередями повторов (Telegram с VPS бывает
+    нестабилен — ретраим в следующих прогонах)."""
+
+    QUEUE = CACHE_DIR / "pending_sends.json"
+
+    def __init__(self, token):
+        self.token = token
+
+    def _flush_queue(self):
+        try:
+            pending = json.loads(self.QUEUE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pending = []
+        if not pending:
+            return
+        still = []
+        for item in pending[:200]:
+            try:
+                tg("sendMessage", self.token, chat_id=item["chat_id"],
+                   text=item["text"])
+            except Exception:
+                still.append(item)
+        self.QUEUE.write_text(json.dumps(still), encoding="utf-8")
+
+    def send(self, chat_id, text):
+        self._flush_queue()
+        try:
+            tg("sendMessage", self.token, chat_id=chat_id, text=text)
+            return True
+        except Exception as e:
+            log.warning("send %s не удался (%s) — в очередь", chat_id, e)
+            try:
+                pending = json.loads(self.QUEUE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pending = []
+            pending.append({"chat_id": chat_id, "text": text})
+            self.QUEUE.write_text(json.dumps(pending[-500:]), encoding="utf-8")
+            return False
+
+    def broadcast(self, chat_ids, text):
+        for cid in chat_ids:
+            self.send(cid, text)
+
+
+# ---------------------------------------------------------------- служебное
+
+def hhmm(s):
+    m = re.match(r"^(\d{1,2}):(\d{2})", str(s).strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def day_label(day):
+    return day.strftime("%d.%m (%a)").replace("Monday", "пн").replace(
+        "Tuesday", "вт").replace("Wednesday", "ср").replace(
+        "Thursday", "чт").replace("Friday", "пт").replace(
+        "Saturday", "сб").replace("Sunday", "вс")
+
+
+def lessons_text(lessons, header):
+    if not lessons:
+        return header + "\nЗанятий нет — отдыхайте!"
+    live = [l for l in lessons if not l.get("cancelled")]
+    cancelled = [l for l in lessons if l.get("cancelled")]
+    lines = [header]
+    for l in live:
+        lines.append("• " + format_class(l))
+    for l in cancelled:
+        lines.append("❌ ОТМЕНЕНА: %s (%s)" % (l["subject"], l["start"]))
+    return "\n".join(lines)
