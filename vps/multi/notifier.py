@@ -20,7 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    Backoff, CaptchaNeeded, CACHE_DIR, Sender, SchedClient,
+    auto_captcha_allow, Backoff, CaptchaNeeded, CACHE_DIR, Sender,
+    SchedClient,
     classes_on_date, db, get_week, hhmm, lessons_text, load_config, now,
     pending_set, tg, users_by_group, day_label)
 
@@ -94,6 +95,15 @@ def main():
             ckey = "captcha_sent:%s" % today_key
             if ckey not in sent:
                 sent[ckey] = 1
+                if not auto_captcha_allow():
+                    all_chats = [c for info in groups.values()
+                                 for c in info["chats"]]
+                    sender.broadcast(
+                        all_chats,
+                        "🔒 Сайт университета просит капчу — уведомления "
+                        "приостановлены. Отправьте /unlock и введите код.")
+                    log.warning("лимит автокапчи исчерпан — просим /unlock")
+                    continue
                 try:
                     c = SchedClient()
                     c.visit()

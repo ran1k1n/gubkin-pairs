@@ -260,6 +260,30 @@ def pending_is(chat_id, max_age_min=180):
         return False
 
 
+# ------------------------------------------- лимит авто-показов капчи в день
+
+AUTO_CAPTCHA_PATH = CACHE_DIR / "auto_captcha.json"
+AUTO_CAPTCHA_LIMIT = 3
+
+
+def auto_captcha_allow(max_per_day=AUTO_CAPTCHA_LIMIT):
+    """True, если авто-показ капчи сегодня ещё не исчерпан (и учитывает
+    показ). Ручной /unlock лимит не тратит и не проверяет."""
+    try:
+        st = json.loads(AUTO_CAPTCHA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    today = now().date().isoformat()
+    if st.get("date") != today:
+        st = {"date": today, "count": 0}
+    if st["count"] >= max_per_day:
+        AUTO_CAPTCHA_PATH.write_text(json.dumps(st), encoding="utf-8")
+        return False
+    st["count"] += 1
+    AUTO_CAPTCHA_PATH.write_text(json.dumps(st), encoding="utf-8")
+    return True
+
+
 def _norm_week(raw, group_id):
     """Сырой ответ act=schedule -> {week_days, lessons} (нормализовано)."""
     rows = raw.get("rows") or {}

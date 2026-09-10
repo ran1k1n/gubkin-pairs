@@ -12,7 +12,8 @@ from datetime import timedelta
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
-    day_label, get_user, pending_clear, pending_is, pending_set,
+    auto_captcha_allow, day_label, get_user, pending_clear,
+    pending_is, pending_set,
     set_enabled, users_all,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
 
@@ -159,9 +160,13 @@ def send_week_preview(send, chat_id, group_id, group_name):
     try:
         week = get_week(group_id, max_age_min=30)
     except CaptchaNeeded:
-        send(chat_id, "🔒 Сайт университета просит подтверждение — "
-                      "решите капчу, это займёт 20 секунд:")
-        cmd_unlock(send, chat_id)
+        if auto_captcha_allow():
+            send(chat_id, "🔒 Сайт университета просит подтверждение — "
+                          "решите капчу, это займёт 20 секунд:")
+            cmd_unlock(send, chat_id)
+        else:
+            send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
+                          "исчерпан — отправьте /unlock вручную.")
         return
     except Backoff:
         send(chat_id, "⏳ Сайт университета недоступен — попробуйте позже.")
@@ -318,8 +323,12 @@ def handle_message(send, conn, msg):
         try:
             week = get_week(user[2], max_age_min=30)
         except CaptchaNeeded:
-            send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
-            cmd_unlock(send, chat_id)
+            if auto_captcha_allow():
+                send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
+                cmd_unlock(send, chat_id)
+            else:
+                send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
+                              "исчерпан — отправьте /unlock вручную.")
             return
         except Backoff:
             send(chat_id, "⏳ Сайт недоступен — попробуйте позже.")
@@ -331,8 +340,12 @@ def handle_message(send, conn, msg):
         try:
             week = get_week(user[2], max_age_min=60)
         except CaptchaNeeded:
-            send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
-            cmd_unlock(send, chat_id)
+            if auto_captcha_allow():
+                send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
+                cmd_unlock(send, chat_id)
+            else:
+                send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
+                              "исчерпан — отправьте /unlock вручную.")
             return
         except Backoff:
             send(chat_id, "⏳ Сайт недоступен — попробуйте позже.")
