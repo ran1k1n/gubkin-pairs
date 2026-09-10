@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 import time
-import urllib.parse
+import urllib.request
 from datetime import timedelta
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
@@ -15,6 +15,9 @@ from common import (  # noqa: E402
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
 
 log = logging.getLogger("gubkin-bot")
+
+# chat_id -> True: ждём код капчи следующим сообщением
+PENDING_CAPTCHA = {}
 
 META_FACULTIES = CACHE_DIR / "meta_faculties.json"
 META_GROUPS = CACHE_DIR / "meta_groups_%s.json"
@@ -79,6 +82,7 @@ PIN_CARD = (
     "/tomorrow — пары на завтра\n"
     "/week — расписание на неделю\n"
     "/group — сменить группу\n"
+    "/unlock — разблокировать расписание (если просит капчу)\n"
     "/stop — отписаться\n\n"
     "🌅 Утром в 07:30 — сводка на день\n"
     "🔔 За 15 минут до пары — напоминание\n"
@@ -91,6 +95,7 @@ BOT_COMMANDS = [
     {"command": "tomorrow", "description": "Пары на завтра"},
     {"command": "week", "description": "Расписание на неделю"},
     {"command": "group", "description": "Сменить группу"},
+    {"command": "unlock", "description": "Разблокировать расписание (капча)"},
     {"command": "stop", "description": "Отписаться от уведомлений"},
 ]
 
@@ -155,10 +160,91 @@ def classes_for(week, day):
     return classes_on_date(week, day)
 
 
+def send_photo(chat_id, img_bytes, caption):
+    """sendPhoto с файлом через multipart (капча — локальный JPEG)."""
+    boundary = "----gubkin%d" % now().timestamp()
+    body = (
+        ("--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n"
+         % (boundary, chat_id)).encode()
+        + ("--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n"
+           % (boundary, caption)).encode()
+        + ("--%s\r\nContent-Disposition: form-data; name=\"photo\"; "
+           "filename=\"captcha.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+           % boundary).encode()
+        + img_bytes
+        + ("\r\n--%s--\r\n" % boundary).encode()
+    )
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot%s/sendPhoto" % TOKEN, data=body)
+    req.add_header("Content-Type",
+                   "multipart/form-data; boundary=%s" % boundary)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            json.loads(resp.read().decode())
+        return True
+    except Exception as e:
+        log.warning("sendPhoto: %s", e)
+        return False
+
+
+def cmd_unlock(send, chat_id):
+    """Показать капчу университета и дождаться кода от пользователя."""
+    try:
+        c = SchedClient()
+        c.visit()
+        img = c.raw("schedule/api/api.php?act=Captcha&method=generateCaptcha")
+        c._save()
+    except Exception as e:
+        send(chat_id, "Не удалось получить капчу с сайта: %s" % e)
+        return
+    if send_photo(chat_id, img,
+                  "🔐 Сайт университета просит подтверждение, что вы человек. "
+                  "Введите код с картинки одним сообщением (5+ символов):"):
+        PENDING_CAPTCHA[chat_id] = True
+    else:
+        send(chat_id, "Не удалось отправить картинку, попробуйте ещё раз: /unlock")
+
+
+def check_captcha_answer(send, conn, chat_id, code):
+    c = SchedClient()
+    try:
+        resp = c.post_json(
+            "schedule/api/api.php?act=Captcha&method=validateCaptcha",
+            {"key": code.strip()})
+    except Exception as e:
+        send(chat_id, "Ошибка проверки: %s. Попробуйте ещё раз: /unlock" % e)
+        PENDING_CAPTCHA.pop(chat_id, None)
+        return
+    if resp.get("state") is True:
+        PENDING_CAPTCHA.pop(chat_id, None)
+        send(chat_id, "✅ Капча принята! Проверяю доступ к расписанию…")
+        user = get_user(conn, chat_id)
+        gid = user[2] if user else 10706
+        try:
+            week = get_week(gid, force=True, max_age_min=1)
+            send(chat_id, "🎉 Готово — расписание снова читается "
+                          "(занятий на этой неделе: %d)."
+                 % len(week.get("lessons", [])))
+        except Backoff:
+            send(chat_id, "Капча принята, но сайт пока снова ограничивает. "
+                          "Система повторит автоматически, ждать не нужно.")
+        except Exception as e:
+            send(chat_id, "Капча принята, но при проверке расписания вышла "
+                          "ошибка: %s. Она попробует сама позже." % e)
+    else:
+        send(chat_id, "❌ Код не подошёл. Вот новая картинка:")
+        cmd_unlock(send, chat_id)
+
+
 def handle_message(send, conn, msg):
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
     user = get_user(conn, chat_id)
+
+    # ответ на капчу (если ждём код — любое не-командное сообщение это код)
+    if PENDING_CAPTCHA.get(chat_id) and not text.startswith("/"):
+        check_captcha_answer(send, conn, chat_id, text)
+        return
 
     if text.startswith("/start"):
         if user:
@@ -213,6 +299,8 @@ def handle_message(send, conn, msg):
             send(chat_id, "Выберите факультет:", kb)
         else:
             send(chat_id, "⏳ Сайт университета не отвечает, попробуйте позже.")
+    elif text.startswith("/unlock"):
+        cmd_unlock(send, chat_id)
     elif text.startswith("/stop"):
         if user:
             del_user(conn, chat_id)

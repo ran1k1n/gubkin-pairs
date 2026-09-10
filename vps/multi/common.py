@@ -85,25 +85,57 @@ def users_by_group(conn):
 # ---------------------------------------------------------------- http
 
 class SchedClient:
-    """Публичный клиент расписания (без логина). Помнит WAF-сессию."""
+    """Публичный клиент расписания (без логина). Помнит WAF-сессию.
+
+    Сессия ПЕРСИСТЕНТНА (cache/session_cookies.txt) и общая для бота и
+    рассыльщика: после решения капчи (см. /unlock в bot.py) все процессы
+    пользуются разблокированной сессией.
+    """
+
+    SESSION_PATH = CACHE_DIR / "session_cookies.txt"
 
     def __init__(self):
-        self.jar = http.cookiejar.CookieJar()
+        self.jar = http.cookiejar.MozillaCookieJar(str(self.SESSION_PATH))
+        try:
+            self.jar.load(ignore_discard=True, ignore_expires=True)
+        except OSError:
+            pass
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar))
         self.opener.addheaders = [("User-Agent", UA),
                                   ("Accept", "application/json, text/plain, */*")]
 
+    def _save(self):
+        try:
+            self.jar.save(ignore_discard=True, ignore_expires=True)
+        except OSError as e:
+            log.warning("не сохранить cookies: %s", e)
+
     def _get(self, path, timeout=HTTP_TIMEOUT):
         req = urllib.request.Request(LKH + path)
         with self.opener.open(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", "replace")
+            data = resp.read()
+        self._save()
+        return data
 
     def visit(self):
         self._get("schedule/")
 
     def api(self, path, timeout=HTTP_TIMEOUT):
-        return json.loads(self._get(path, timeout))
+        return json.loads(self._get(path, timeout).decode("utf-8", "replace"))
+
+    def raw(self, path, timeout=HTTP_TIMEOUT):
+        """Бинарный ответ (например, картинка капчи)."""
+        return self._get(path, timeout)
+
+    def post_json(self, path, payload, timeout=HTTP_TIMEOUT):
+        req = urllib.request.Request(LKH + path, method="POST")
+        req.data = json.dumps(payload).encode("utf-8")
+        req.add_header("Content-Type", "application/json")
+        with self.opener.open(req, timeout=timeout) as resp:
+            data = resp.read()
+        self._save()
+        return json.loads(data.decode("utf-8", "replace"))
 
 
 # ---------------------------------------------------------------- кэш
