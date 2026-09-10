@@ -1,0 +1,11 @@
+[Unit]
+Description=Gubkin schedule bot
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/gubkin/multi/bot.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

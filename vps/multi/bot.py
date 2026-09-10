@@ -562,7 +562,7 @@ def main():
                      allowed_updates=["message", "callback_query"])
         except Exception as e:
             log.warning("getUpdates: %s", e)
-            time.sleep(5)
+            time.sleep(1)
             continue
         for upd in res or []:
             offset = upd["update_id"] + 1
