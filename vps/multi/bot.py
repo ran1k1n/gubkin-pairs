@@ -495,7 +495,11 @@ def handle_callback(send, conn, cb):
         send(chat_id, "✅ Группа %s сохранена!\n\n"
                       "Утром в 07:30 пришлю пары на день, за 15 минут до "
                       "пары — напомню." % code)
-        # карточка-подсказка, закрепляется в чате нового пользователя
+        # карточка-подсказка: старая открепляется, новая закрепляется
+        try:
+            tg("unpinAllChatMessages", TOKEN, chat_id=chat_id)
+        except Exception as e:
+            log.warning("unpin не удался: %s", e)
         card = send(chat_id, PIN_CARD)
         if card and card.get("message_id"):
             try:
