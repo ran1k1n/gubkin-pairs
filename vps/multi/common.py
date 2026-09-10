@@ -52,14 +52,26 @@ def db():
         username TEXT,
         group_id INTEGER NOT NULL,
         group_name TEXT NOT NULL,
-        created_at TEXT NOT NULL)""")
+        created_at TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1)""")
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
     return conn
 
 
 def add_user(conn, chat_id, username, group_id, group_name):
     conn.execute(
-        "INSERT OR REPLACE INTO users VALUES (?,?,?,?,?)",
+        "INSERT OR REPLACE INTO users(chat_id,username,group_id,group_name,"
+        "created_at,enabled) VALUES (?,?,?,?,?,1)",
         (chat_id, username, group_id, group_name, now().isoformat()))
+    conn.commit()
+
+
+def set_enabled(conn, chat_id, enabled):
+    conn.execute("UPDATE users SET enabled=? WHERE chat_id=?",
+                 (1 if enabled else 0, chat_id))
     conn.commit()
 
 
@@ -75,10 +87,18 @@ def get_user(conn, chat_id):
     return row
 
 
+def users_all(conn):
+    return conn.execute(
+        "SELECT chat_id,username,group_id,group_name,enabled FROM users "
+        "ORDER BY created_at").fetchall()
+
+
 def users_by_group(conn):
+    """Только включённые пользователи — для рассылки уведомлений."""
     out = {}
     for chat_id, _u, gid, gname in conn.execute(
-            "SELECT chat_id,username,group_id,group_name FROM users"):
+            "SELECT chat_id,username,group_id,group_name FROM users "
+            "WHERE enabled=1"):
         out.setdefault(gid, {"name": gname, "chats": []})["chats"].append(chat_id)
     return out
 

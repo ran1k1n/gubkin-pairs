@@ -13,6 +13,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
     day_label, get_user, pending_clear, pending_is, pending_set,
+    set_enabled, users_all,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
 
 log = logging.getLogger("gubkin-bot")
@@ -236,6 +237,60 @@ def check_captcha_answer(send, conn, chat_id, code):
         cmd_unlock(send, chat_id)
 
 
+
+def render_panel(conn):
+    rows = users_all(conn)
+    on = sum(1 for r in rows if r[4])
+    lines = ["👑 Админ-панель\n",
+             "Участников: %d (получают: %d, отключено: %d)" % (len(rows), on,
+                                                               len(rows) - on)]
+    kb = []
+    for chat_id, username, gid, gname, enabled in rows:
+        name = "@" + username if username else str(chat_id)
+        lines.append("%s %s — %s" % ("✅" if enabled else "⏸", name, gname))
+        kb.append([
+            {"text": "%s %s" % (name[:20], "выключить" if enabled else "включить"),
+             "callback_data": "en:%s" % chat_id},
+            {"text": "🗑", "callback_data": "del:%s" % chat_id},
+        ])
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def is_admin(chat_id):
+    return CFG.get("admin_chat_id") and str(chat_id) == str(CFG["admin_chat_id"])
+
+
+def handle_callback_admin(send, conn, cb):
+    msg = cb.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    data = cb.get("data", "")
+    if not chat_id or not is_admin(chat_id):
+        return
+    if data.startswith("en:"):
+        target = int(data[3:])
+        row = get_user(conn, target)
+        if row:
+            cur = conn.execute("SELECT enabled FROM users WHERE chat_id=?",
+                               (target,)).fetchone()[0]
+            set_enabled(conn, target, not cur)
+    elif data.startswith("del:"):
+        del_user(conn, int(data[4:]))
+    else:
+        return
+    try:
+        tg("answerCallbackQuery", TOKEN, callback_query_id=cb["id"])
+    except Exception:
+        pass
+    if message_id:
+        text, kb = render_panel(conn)
+        try:
+            tg("editMessageText", TOKEN, chat_id=chat_id,
+               message_id=message_id, text=text, reply_markup=kb)
+        except Exception as e:
+            log.warning("editMessageText: %s")
+
+
 def handle_message(send, conn, msg):
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
@@ -309,10 +364,19 @@ def handle_message(send, conn, msg):
             send(chat_id, "⏳ Сайт университета не отвечает, попробуйте позже.")
     elif text.startswith("/unlock"):
         cmd_unlock(send, chat_id)
+    elif text.startswith("/admin"):
+        if is_admin(chat_id):
+            text_panel, kb = render_panel(conn)
+            send(chat_id, text_panel, kb)
+        else:
+            send(chat_id, "Эта команда только для владельца бота.")
     elif text.startswith("/stop"):
         if user:
             del_user(conn, chat_id)
             send(chat_id, "Вы отписались. Вернуться: /start")
+            if not is_admin(chat_id):
+                send(CFG["admin_chat_id"],
+                     "➖ Участник @%s отписался" % (user[1] or user[0]))
         else:
             send(chat_id, "Вы и не были подписаны 🙂")
     elif text.startswith("/help") or not text.startswith("/"):
@@ -329,6 +393,9 @@ def handle_callback(send, conn, cb):
         tg("answerCallbackQuery", TOKEN, callback_query_id=cb["id"])
     except Exception:
         pass
+    if data.startswith(("en:", "del:")):
+        handle_callback_admin(send, conn, cb)
+        return
     if data == "back":
         kb = kb_faculties()
         if kb:
@@ -350,6 +417,11 @@ def handle_callback(send, conn, cb):
         add_user(conn, chat_id, username, gid, code)
         log.info("новый пользователь %s -> группа %s (%s)",
                  chat_id, gid, code)
+        if is_admin(chat_id):
+            send(chat_id, "Вы владелец этого бота — панель управления: /admin")
+        else:
+            send(CFG["admin_chat_id"],
+                 "➕ Новый участник: @%s — группа %s" % (username or chat_id, code))
         send(chat_id, "✅ Группа %s сохранена!\n\n"
                       "Утром в 07:30 пришлю пары на день, за 15 минут до "
                       "пары — напомню." % code)
@@ -365,7 +437,7 @@ def handle_callback(send, conn, cb):
 
 
 def main():
-    global TOKEN
+    global TOKEN, CFG
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
