@@ -5,8 +5,8 @@
 import json
 import logging
 import sys
+import threading
 import time
-import urllib.request
 from datetime import timedelta
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
@@ -20,17 +20,17 @@ log = logging.getLogger("gubkin-bot")
 PENDING_CAPTCHA = {}
 
 META_FACULTIES = CACHE_DIR / "meta_faculties.json"
-META_TTL = 86400  # сутки
+META_TTL = 604800  # 7 дней: справочники почти не меняются
 
 
 def meta_groups_path(fid):
     return CACHE_DIR / ("meta_groups_%s.json" % fid)
 
 
-def cached_json(path):
+def cached_json(path, allow_stale=False):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if now().timestamp() - data.get("_ts", 0) < META_TTL:
+        if allow_stale or now().timestamp() - data.get("_ts", 0) < META_TTL:
             return data.get("data")
     except (OSError, ValueError):
         pass
@@ -60,13 +60,20 @@ def faculty_groups(fid):
     data = cached_json(path)
     if data:
         return data
-    c = SchedClient()
-    c.visit()
-    raw = c.api("schedule/api/api.php?act=list&method=getFacultyGroups"
-                "&facultyId=%s" % fid)
-    data = sorted(((r["id"], r["code"]) for r in raw.get("rows", [])),
-                  key=lambda x: x[1])
-    store_json(path, data)
+    try:
+        c = SchedClient()
+        c.visit()
+        raw = c.api("schedule/api/api.php?act=list&method=getFacultyGroups"
+                    "&facultyId=%s" % fid)
+        data = sorted(((r["id"], r["code"]) for r in raw.get("rows", [])),
+                      key=lambda x: x[1])
+        store_json(path, data)
+    except Exception:
+        # сайт недоступен — отдаём устаревший кэш, если он есть
+        data = cached_json(path, allow_stale=True)
+        if not data:
+            raise
+    return data
     return data
 
 
@@ -168,26 +175,10 @@ def classes_for(week, day):
 
 
 def send_photo(chat_id, img_bytes, caption):
-    """sendPhoto с файлом через multipart (капча — локальный JPEG)."""
-    boundary = "----gubkin%d" % now().timestamp()
-    body = (
-        ("--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n"
-         % (boundary, chat_id)).encode()
-        + ("--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n"
-           % (boundary, caption)).encode()
-        + ("--%s\r\nContent-Disposition: form-data; name=\"photo\"; "
-           "filename=\"captcha.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
-           % boundary).encode()
-        + img_bytes
-        + ("\r\n--%s--\r\n" % boundary).encode()
-    )
-    req = urllib.request.Request(
-        "https://api.telegram.org/bot%s/sendPhoto" % TOKEN, data=body)
-    req.add_header("Content-Type",
-                   "multipart/form-data; boundary=%s" % boundary)
+    """sendPhoto через curl (multipart делает tg())."""
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            json.loads(resp.read().decode())
+        tg("sendPhoto", TOKEN, files={"photo": ("captcha.jpg", img_bytes)},
+           chat_id=chat_id, caption=caption)
         return True
     except Exception as e:
         log.warning("sendPhoto: %s", e)
@@ -399,6 +390,24 @@ def main():
         log.info("меню команд установлено")
     except Exception as e:
         log.warning("setMyCommands: %s", e)
+
+    # фоновый прогрев справочников (факультеты + группы всех факультетов),
+    # чтобы нажатия кнопок откликались мгновенно
+    def warm_meta():
+        try:
+            fs = faculties()
+        except Exception as e:
+            log.warning("прогрев: факультеты недоступны: %s", e)
+            return
+        for fid, _name in fs:
+            try:
+                faculty_groups(fid)
+            except Exception as e:
+                log.warning("прогрев: группы %s: %s", fid, e)
+            time.sleep(1.5)
+        log.info("справочники прогреты")
+
+    threading.Thread(target=warm_meta, daemon=True).start()
 
     log.info("бот запущен, offset=%d", offset)
     while True:

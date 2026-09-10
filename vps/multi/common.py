@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import sqlite3
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -105,6 +106,9 @@ class SchedClient:
         self.opener.addheaders = [("User-Agent", UA),
                                   ("Accept", "application/json, text/plain, */*")]
 
+    def _has_session(self):
+        return any(c.name == "PHPSESSID" for c in self.jar)
+
     def _save(self):
         try:
             self.jar.save(ignore_discard=True, ignore_expires=True)
@@ -118,8 +122,13 @@ class SchedClient:
         self._save()
         return data
 
-    def visit(self):
+    def visit(self, force=False):
+        """Тяжёлая загрузка страницы нужна один раз на сессию (WAF);
+        если PHPSESSID уже в банке — пропускаем для скорости."""
+        if not force and self._has_session():
+            return
         self._get("schedule/")
+        self._save()
 
     def api(self, path, timeout=HTTP_TIMEOUT):
         return json.loads(self._get(path, timeout).decode("utf-8", "replace"))
@@ -321,16 +330,50 @@ def format_class(c, with_time=True):
 
 # ---------------------------------------------------------------- telegram
 
-def tg(api_method, token, **params):
+def tg(api_method, token, files=None, **params):
+    """Вызов Bot API через curl (Happy Eyeballs обходит зависания
+    отдельных IP api.telegram.org с Aeza; urllib в таких случаях молчит
+    до таймаута). files: {поле: (filename, bytes)} — multipart-выгрузка."""
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
-    data = json.dumps(params).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        body = json.loads(resp.read().decode())
-    if body.get("ok") is not True:
-        raise RuntimeError("telegram %s: %s" % (api_method, body))
-    return body.get("result")
+    long_poll = api_method == "getUpdates"
+    cmd = ["curl", "-s", "--connect-timeout", "8",
+           "--max-time", "45" if long_poll else "25",
+           "--retry", "2", "--retry-all-errors"]
+    if files:
+        import tempfile
+        tmps = []
+        try:
+            for name, (fname, data) in files.items():
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+                tmp.write(data)
+                tmp.close()
+                tmps.append(tmp.name)
+                cmd += ["-F", "%s=@%s;filename=%s" % (name, tmp.name, fname)]
+            for k, v in params.items():
+                cmd += ["-F", "%s=%s" % (k, v)]
+            cmd.append(url)
+            r = subprocess.run(cmd, capture_output=True, timeout=60)
+        finally:
+            import os
+            for p in tmps:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    else:
+        for k, v in params.items():
+            if isinstance(v, (list, dict)):
+                v = json.dumps(v, ensure_ascii=False)
+            cmd += ["--data-urlencode", "%s=%s" % (k, v)]
+        cmd.append(url)
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+    body = r.stdout.decode("utf-8", "replace")
+    if not body:
+        raise RuntimeError("telegram %s: пустой ответ" % api_method)
+    d = json.loads(body)
+    if d.get("ok") is not True:
+        raise RuntimeError("telegram %s: %s" % (api_method, d))
+    return d.get("result")
 
 
 class Sender:
