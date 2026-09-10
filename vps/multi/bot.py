@@ -12,13 +12,10 @@ from datetime import timedelta
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
-    day_label, get_user,
+    day_label, get_user, pending_clear, pending_is, pending_set,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
 
 log = logging.getLogger("gubkin-bot")
-
-# chat_id -> True: ждём код капчи следующим сообщением
-PENDING_CAPTCHA = {}
 
 META_FACULTIES = CACHE_DIR / "meta_faculties.json"
 META_TTL = 604800  # 7 дней: справочники почти не меняются
@@ -203,7 +200,7 @@ def cmd_unlock(send, chat_id):
     if send_photo(chat_id, img,
                   "🔐 Сайт университета просит подтверждение, что вы человек. "
                   "Введите код с картинки одним сообщением (5+ символов):"):
-        PENDING_CAPTCHA[chat_id] = True
+        pending_set(chat_id)
     else:
         send(chat_id, "Не удалось отправить картинку, попробуйте ещё раз: /unlock")
 
@@ -216,10 +213,10 @@ def check_captcha_answer(send, conn, chat_id, code):
             {"key": code.strip()})
     except Exception as e:
         send(chat_id, "Ошибка проверки: %s. Попробуйте ещё раз: /unlock" % e)
-        PENDING_CAPTCHA.pop(chat_id, None)
+        pending_clear(chat_id)
         return
     if resp.get("state") is True:
-        PENDING_CAPTCHA.pop(chat_id, None)
+        pending_clear()  # капча снята — всем больше не нужно отвечать
         send(chat_id, "✅ Капча принята! Проверяю доступ к расписанию…")
         user = get_user(conn, chat_id)
         gid = user[2] if user else 10706
@@ -245,7 +242,7 @@ def handle_message(send, conn, msg):
     user = get_user(conn, chat_id)
 
     # ответ на капчу (если ждём код — любое не-командное сообщение это код)
-    if PENDING_CAPTCHA.get(chat_id) and not text.startswith("/"):
+    if pending_is(chat_id) and not text.startswith("/"):
         check_captcha_answer(send, conn, chat_id, text)
         return
 

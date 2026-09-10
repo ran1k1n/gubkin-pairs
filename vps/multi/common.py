@@ -197,6 +197,49 @@ class CaptchaNeeded(Exception):
     """Сайт ответил 429 «введите капчу» — нужен человек с /unlock."""
 
 
+# ------------------------------------------- ожидание кода капчи (общий файл)
+
+PENDING_PATH = CACHE_DIR / "pending_captcha.json"
+
+
+def pending_load():
+    try:
+        return json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def pending_set(chat_id):
+    """Отметить чат как ожидающий код капчи (файл — чтобы бот и
+    рассыльщик, запущенные как разные процессы, видели одно состояние)."""
+    p = pending_load()
+    p[str(chat_id)] = now().isoformat()
+    PENDING_PATH.write_text(json.dumps(p), encoding="utf-8")
+
+
+def pending_clear(chat_id=None):
+    """Снять отметку; без аргумента — у всех (капча разблокирует систему
+    целиком, остальным ждать кода больше не нужно)."""
+    if chat_id is None:
+        PENDING_PATH.write_text("{}", encoding="utf-8")
+        return
+    p = pending_load()
+    p.pop(str(chat_id), None)
+    PENDING_PATH.write_text(json.dumps(p), encoding="utf-8")
+
+
+def pending_is(chat_id, max_age_min=180):
+    p = pending_load()
+    ts = p.get(str(chat_id))
+    if not ts:
+        return False
+    try:
+        return (now() - datetime.fromisoformat(ts)) <= timedelta(
+            minutes=max_age_min)
+    except ValueError:
+        return False
+
+
 def _norm_week(raw, group_id):
     """Сырой ответ act=schedule -> {week_days, lessons} (нормализовано)."""
     rows = raw.get("rows") or {}

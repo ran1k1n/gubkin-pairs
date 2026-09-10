@@ -20,8 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    Backoff, CaptchaNeeded, CACHE_DIR, Sender, classes_on_date, db, get_week, hhmm,
-    lessons_text, load_config, now, users_by_group, day_label)
+    Backoff, CaptchaNeeded, CACHE_DIR, Sender, SchedClient,
+    classes_on_date, db, get_week, hhmm, lessons_text, load_config, now,
+    pending_set, tg, users_by_group, day_label)
 
 SENT_PATH = CACHE_DIR / "sent.json"
 REFRESH_MIN = 180  # днём обновлять кэш раз в 3 часа ради отмен
@@ -88,17 +89,35 @@ def main():
                             force=need_refresh,
                             max_age_min=None if need_refresh else REFRESH_MIN)
         except CaptchaNeeded:
-            ckey = "captcha_asked:%s" % today_key
+            # разослать капчу всем подписчикам: любой введённый код
+            # разблокирует общую сессию для всей системы
+            ckey = "captcha_sent:%s" % today_key
             if ckey not in sent:
                 sent[ckey] = 1
-                all_chats = [c for info in groups.values()
-                             for c in info["chats"]]
-                sender.broadcast(all_chats,
-                                 "🔒 Сайт университета просит капчу — "
-                                 "уведомления приостановлены.\n"
-                                 "Отправьте боту /unlock и введите код с "
-                                 "картинки — всё оживёт.")
-            log.warning("группа %s: нужна капча", gid)
+                try:
+                    c = SchedClient()
+                    c.visit()
+                    img = c.raw("schedule/api/api.php?act=Captcha"
+                                "&method=generateCaptcha")
+                    c._save()
+                except Exception as e:
+                    log.error("капчу получить не удалось: %s", e)
+                    continue
+                for info in groups.values():
+                    for chat in info["chats"]:
+                        try:
+                            tg("sendPhoto", CFG["telegram_bot_token"],
+                               files={"photo": ("captcha.jpg", img)},
+                               chat_id=chat,
+                               caption="🔒 Сайт университета просит "
+                                       "подтверждение. Ответьте кодом с "
+                                       "картинки одним сообщением — это "
+                                       "вернёт напоминания всем.")
+                            pending_set(chat)
+                        except Exception as e:
+                            log.warning("капча не доставлена %s: %s",
+                                        chat, e)
+            log.warning("группа %s: нужна капча — разослана", gid)
             continue
         except Backoff:
             log.warning("группа %s: сайт недоступен, пропуск", gid)
