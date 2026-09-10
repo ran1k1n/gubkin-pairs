@@ -67,16 +67,27 @@ def main():
     sent = load_sent()
     today_key = today.isoformat()
 
-    # напоминание об оплате сервера (владельцу, раз в месяц)
+    # напоминания об оплате сервера владельцу: за неделю, за день и в день
     rent_day = int(CFG.get("rent_reminder_day", 1))
-    rkey = "rent:%s" % today_key[:7]
-    if (t.day == rent_day and t.hour >= 10 and rkey not in sent
-            and CFG.get("admin_chat_id")):
-        sent[rkey] = 1
-        sender.send(int(CFG["admin_chat_id"]),
-                    "💳 Напоминание: сегодня пора оплатить аренду сервера "
-                    "Aeza (~100–150₽). Пополните баланс в панели aeza.net, "
-                    "чтобы напоминания о парах не остановились.")
+    if CFG.get("admin_chat_id"):
+        import calendar as _cal
+        days_in_month = _cal.monthrange(t.year, t.month)[1]
+        due = t.date().replace(day=rent_day) if rent_day <= days_in_month else None
+        if due:
+            left = (due - t.date()).days
+            msgs = {
+                7: "🗓 Через неделю (%s) — оплата сервера Aeza (~100–150₽). "
+                   "Не забудьте пополнить баланс." % due.strftime("%d.%m"),
+                1: "⚠️ Завтра оплата сервера Aeza (~100–150₽) — "
+                   "пополните баланс уже сегодня.",
+                0: "💳 Сегодня пора оплатить сервер Aeza (~100–150₽). "
+                   "Пополните баланс, чтобы напоминания о парах не остановились.",
+            }
+            if left in msgs:
+                rkey = "rent%s:%s" % (left, due.isoformat())
+                if t.hour >= 10 and rkey not in sent:
+                    sent[rkey] = 1
+                    sender.send(int(CFG["admin_chat_id"]), msgs[left])
 
     for gid, info in groups.items():
         chats = info["chats"]
