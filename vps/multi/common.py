@@ -340,11 +340,26 @@ def sched_cache_path(gid, day=None):
 
 
 def load_sched(gid, day=None):
-    try:
-        return json.loads(
-            sched_cache_path(gid, day).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    """Текущая неделя — из основного файла; для конкретного дня сначала
+    основной файл, затем файл предзагрузки этой недели (вчерашний
+    воскресный prefetch). Отдаём тот, что покрывает запрошенный день."""
+    paths = [sched_cache_path(gid, day)]
+    if day is not None:
+        paths.append(CACHE_DIR / ("sched_%s_%s.json"
+                                  % (gid, week_key(day))))
+    for p in paths:
+        try:
+            cache = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if day is None:
+            return cache
+        date_str = day.strftime("%d-%m-%Y") if isinstance(day, datetime) \
+            else day.strftime("%d-%m-%Y")
+        if any(d.get("date") == date_str
+               for d in cache.get("week_days", [])):
+            return cache
+    return None
 
 
 def save_sched(gid, data, day=None):
@@ -412,9 +427,10 @@ def get_week(group_id, day=None, force=False, max_age_min=None):
                 minutes=max_age_min or 0)
         except ValueError:
             pass
-    if (cache and covers_day and not force
-            and (fresh or cache.get("fetched_at", "")[:10]
-                 == now().date().isoformat())):
+    # ЛЮБОЙ кэш, покрывающий запрошенный день, отдаётся мгновенно:
+    # обновлением занимается рассыльщик (2 раза в сутки, force=True),
+    # пользовательские команды никогда не ждут сеть
+    if cache and covers_day and not force:
         return cache
     if backoff_active():
         if covers_day:
@@ -493,14 +509,61 @@ def classes_on_date(week, day):
 
 # ---------------------------------------------------------------- telegram
 
+TG_IP_PATH = CACHE_DIR / "tg_ip.txt"
+
+
+def _tg_ip():
+    try:
+        ip = TG_IP_PATH.read_text().strip()
+        return ip or None
+    except OSError:
+        return None
+
+
+def _tg_find_ip():
+    """Ищет IP api.telegram.org, который РЕАЛЬНО отвечает по HTTPS
+    (TCP-коннект есть и у таких, что виснут на SNI-фильтрации)."""
+    import socket
+    import subprocess
+    try:
+        infos = socket.getaddrinfo("api.telegram.org", 443, socket.AF_INET)
+    except OSError:
+        return None
+    ips = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in ips:
+            ips.append(ip)
+    for ip in ips:
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "--resolve", "api.telegram.org:443:%s" % ip,
+                 "--connect-timeout", "3", "--max-time", "6",
+                 "https://api.telegram.org/"],
+                capture_output=True, timeout=8)
+            if r.stdout.decode().strip() in ("200", "302"):
+                TG_IP_PATH.write_text(ip)
+                return ip
+        except Exception:
+            continue
+    return None
+
+
 def tg(api_method, token, files=None, **params):
-    """Вызов Bot API через curl (Happy Eyeballs обходит зависания
-    отдельных IP api.telegram.org). files: {поле: (filename, bytes)}."""
+    """Вызов Bot API через curl. Живой IP api.telegram.org закрепляется
+    (--resolve): у Aeza часть адресов TG лежит — перебор каждый раз
+    стоил секунд на каждое сообщение."""
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
     long_poll = api_method == "getUpdates"
-    cmd = ["curl", "-s", "--connect-timeout", "4",
+    cmd = ["curl", "-s", "--connect-timeout", "3",
            "--max-time", "45" if long_poll else "15",
            "--retry", "1", "--retry-all-errors"]
+    ip = _tg_ip()
+    if not ip:
+        ip = _tg_find_ip()
+    if ip:
+        cmd += ["--resolve", "api.telegram.org:443:%s" % ip]
     if files:
         import tempfile
         tmps = []
@@ -531,6 +594,21 @@ def tg(api_method, token, files=None, **params):
         cmd.append(url)
         r = subprocess.run(cmd, capture_output=True, timeout=60)
     body = r.stdout.decode("utf-8", "replace")
+    if not body and ip:
+        # закреплённый IP перестал работать — переищем и повторим один раз
+        try:
+            TG_IP_PATH.unlink()
+        except OSError:
+            pass
+        ip2 = _tg_find_ip()
+        if ip2:
+            try:
+                cmd[cmd.index("--resolve") + 1] = \
+                    "api.telegram.org:443:%s" % ip2
+            except ValueError:
+                cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
+            r = subprocess.run(cmd, capture_output=True, timeout=60)
+            body = r.stdout.decode("utf-8", "replace")
     if not body:
         raise RuntimeError("telegram %s: пустой ответ" % api_method)
     d = json.loads(body)
