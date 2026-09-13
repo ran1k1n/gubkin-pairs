@@ -15,7 +15,8 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
     auto_captcha_allow, day_label, get_user, manual_unlock_allow,
-    needs_refresh, pending_clear, pending_is,
+    needs_refresh, classes_on_date, touch_user,
+    pending_clear, pending_is,
     pending_set, set_enabled, users_all, week_type_label,
     pending_is, pending_set,
     set_enabled, users_all,
@@ -555,10 +556,13 @@ def handle_callback(send, conn, cb):
     if data.startswith("f:"):
         fid = data[2:]
         kb = kb_groups(fid)
-        if kb:
+        if kb and len(kb["inline_keyboard"]) > 1:  # есть группы + кнопка назад
             send(chat_id, "Выберите группу:", kb)
+        elif kb:
+            send(chat_id, "У этого факультета нет групп в расписании.")
         else:
-            send(chat_id, "⏳ Не удалось получить список групп, попробуйте позже.")
+            send(chat_id, "⏳ Не удалось получить список групп, "
+                          "попробуйте позже.")
         return
     if data.startswith("g:"):
         rest = data[2:]
@@ -646,6 +650,23 @@ def main():
 
     threading.Thread(target=warm_meta, daemon=True).start()
 
+    sem = threading.Semaphore(5)  # не более 5 одновременных обработок
+
+    def process_update(upd):
+        """Каждый апдейт — в отдельном потоке со СВОИМ соединением базы:
+        медленная операция одного пользователя не задерживает остальных."""
+        with sem:
+            uconn = db()
+            try:
+                if "message" in upd:
+                    handle_message(send, uconn, upd["message"])
+                elif "callback_query" in upd:
+                    handle_callback(send, uconn, upd["callback_query"])
+            except Exception:
+                log.exception("ошибка обработки апдейта")
+            finally:
+                uconn.close()
+
     log.info("бот запущен, offset=%d", offset)
     while True:
         try:
@@ -658,13 +679,8 @@ def main():
         for upd in res or []:
             offset = upd["update_id"] + 1
             offset_path.write_text(str(offset))
-            try:
-                if "message" in upd:
-                    handle_message(send, conn, upd["message"])
-                elif "callback_query" in upd:
-                    handle_callback(send, conn, upd["callback_query"])
-            except Exception:
-                log.exception("ошибка обработки апдейта")
+            threading.Thread(target=process_update, args=(upd,),
+                             daemon=True).start()
 
 
 if __name__ == "__main__":
