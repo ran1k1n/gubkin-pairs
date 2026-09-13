@@ -15,15 +15,16 @@ import json
 import logging
 import re
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     auto_captcha_allow, Backoff, CaptchaNeeded, CACHE_DIR, Sender,
-    SchedClient,
-    classes_on_date, db, get_week, hhmm, lessons_text, load_config, now,
-    pending_set, tg, users_by_group, day_label)
+    SchedClient, classes_on_date, db, get_week, hhmm,
+    lessons_text, load_config, needs_refresh, now, pending_set, tg,
+    users_by_group, day_label, week_key)
 
 SENT_PATH = CACHE_DIR / "sent.json"
 REFRESH_MIN = 180  # днём обновлять кэш раз в 3 часа ради отмен
@@ -89,7 +90,11 @@ def main():
                     sent[rkey] = 1
                     sender.send(int(CFG["admin_chat_id"]), msgs[left])
 
+    first = True
     for gid, info in groups.items():
+        if not first:
+            time.sleep(5)  # щадящий интервал: WAF университета чувствителен
+        first = False
         chats = info["chats"]
         gname = info["name"]
         # --- кэш недели
@@ -184,6 +189,17 @@ def main():
                             chats,
                             "⚠️ Изменения в паре %s\n%s" % (
                                 l["start"], format_simple(l)))
+
+        # предзагрузка следующей недели: в воскресенье «завтра» уже
+        # относится к новой неделе, и /tomorrow должен работать
+        tomorrow = t + timedelta(days=1)
+        if week_key(tomorrow) != week_key(t) and needs_refresh(gid, day=tomorrow):
+            try:
+                get_week(gid, day=tomorrow, force=True, max_age_min=None)
+            except (Backoff, CaptchaNeeded):
+                pass
+            except Exception as e:
+                log.warning("предзагрузка %s: %s", gid, e)
 
         live = [l for l in lessons_today if not l.get("cancelled")]
 
