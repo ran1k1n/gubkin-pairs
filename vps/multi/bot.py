@@ -7,6 +7,8 @@ import logging
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import timedelta
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
@@ -310,16 +312,36 @@ def check_captcha_answer(send, conn, chat_id, code):
 
 
 
+def activity_label(last_seen):
+    if not last_seen:
+        return "не пользовался"
+    try:
+        dt = __import__("datetime").datetime.fromisoformat(last_seen)
+    except ValueError:
+        return "не пользовался"
+    days = (now().date() - dt.date()).days
+    if days <= 0:
+        return "активен сегодня"
+    if days == 1:
+        return "был вчера"
+    return "был %d дн. назад" % days
+
+
 def render_panel(conn):
     rows = users_all(conn)
     on = sum(1 for r in rows if r[4])
+    active = sum(1 for r in rows if r[5] and __import__("datetime")
+                 .datetime.fromisoformat(r[5]).date() == now().date())
     lines = ["👑 Админ-панель\n",
-             "Участников: %d (получают: %d, отключено: %d)" % (len(rows), on,
-                                                               len(rows) - on)]
+             "Участников: %d | получают: %d | отключено: %d | "
+             "активны сегодня: %d" % (len(rows), on, len(rows) - on, active),
+             ""]
     kb = []
-    for chat_id, username, gid, gname, enabled in rows:
+    for chat_id, username, gid, gname, enabled, last_seen, notified in rows:
         name = "@" + username if username else str(chat_id)
         lines.append("%s %s — %s" % ("✅" if enabled else "⏸", name, gname))
+        lines.append("     %s • уведомлений: %d"
+                     % (activity_label(last_seen), notified or 0))
         kb.append([
             {"text": "%s %s" % (name[:20], "выключить" if enabled else "включить"),
              "callback_data": "en:%s" % chat_id},
@@ -367,6 +389,8 @@ def handle_message(send, conn, msg):
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
     user = get_user(conn, chat_id)
+    if user:
+        touch_user(conn, chat_id)
 
     # ответ на капчу (если ждём код — любое не-командное сообщение это код)
     if pending_is(chat_id) and not text.startswith("/"):
@@ -514,6 +538,8 @@ def handle_callback(send, conn, cb):
     data = cb.get("data", "")
     if not chat_id:
         return
+    if get_user(conn, chat_id):
+        touch_user(conn, chat_id)
     try:
         tg("answerCallbackQuery", TOKEN, callback_query_id=cb["id"])
     except Exception:

@@ -58,11 +58,15 @@ def db():
         group_name TEXT NOT NULL,
         created_at TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1)""")
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN "
-                     "enabled INTEGER NOT NULL DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass  # колонка уже есть
+    for ddl in ("ALTER TABLE users ADD COLUMN "
+                "enabled INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE users ADD COLUMN last_seen TEXT",
+                "ALTER TABLE users ADD COLUMN notified INTEGER "
+                "NOT NULL DEFAULT 0"):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
     return conn
 
 
@@ -80,6 +84,22 @@ def set_enabled(conn, chat_id, enabled):
     conn.commit()
 
 
+def touch_user(conn, chat_id):
+    """Отметить активность пользователя (любое сообщение/нажатие)."""
+    conn.execute("UPDATE users SET last_seen=? WHERE chat_id=?",
+                 (now().isoformat(), chat_id))
+    conn.commit()
+
+
+def bump_notified(conn, chat_id):
+    try:
+        conn.execute("UPDATE users SET notified=notified+1 WHERE chat_id=?",
+                     (chat_id,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
 def del_user(conn, chat_id):
     conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
     conn.commit()
@@ -93,8 +113,8 @@ def get_user(conn, chat_id):
 
 def users_all(conn):
     return conn.execute(
-        "SELECT chat_id,username,group_id,group_name,enabled FROM users "
-        "ORDER BY created_at").fetchall()
+        "SELECT chat_id,username,group_id,group_name,enabled,"
+        "last_seen,notified FROM users ORDER BY created_at").fetchall()
 
 
 def users_by_group(conn):
@@ -548,7 +568,6 @@ class Sender:
         self._flush_queue()
         try:
             tg("sendMessage", self.token, chat_id=chat_id, text=text)
-            return True
         except Exception as e:
             log.warning("send %s не удался (%s) — в очередь", chat_id, e)
             try:
@@ -560,6 +579,13 @@ class Sender:
             self.QUEUE.write_text(json.dumps(pending[-500:]),
                                   encoding="utf-8")
             return False
+        try:
+            c = db()
+            bump_notified(c, chat_id)
+            c.close()
+        except Exception:
+            pass
+        return True
 
     def broadcast(self, chat_ids, text):
         for cid in chat_ids:
