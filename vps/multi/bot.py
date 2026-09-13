@@ -227,12 +227,60 @@ def cmd_unlock(send, chat_id, manual=True):
         send(chat_id, "Не удалось отправить картинку, попробуйте ещё раз: /unlock")
 
 
+def _retry_validation(send, chat_id, code, gid):
+    """Фоновый авто-повтор проверки кода, когда сайт её придавил (429)."""
+    c = SchedClient()
+    for _ in range(3):
+        time.sleep(45)
+        try:
+            resp = c.post_json(
+                "schedule/api/api.php?act=Captcha&method=validateCaptcha",
+                {"key": code})
+        except Exception:
+            continue
+        if resp.get("state") is True:
+            pending_clear()
+            send(chat_id, "✅ Капча принята! Проверяю доступ к расписанию…")
+            try:
+                week = get_week(gid, force=True, max_age_min=1)
+                send(chat_id, "🎉 Готово — расписание снова читается "
+                              "(занятий на этой неделе: %d)."
+                     % len(week.get("lessons", [])))
+            except Backoff:
+                send(chat_id, "Капча принята, но сайт пока ограничивает — "
+                              "система повторит сама, ждать не нужно.")
+            except Exception as e:
+                send(chat_id, "Капча принята, но проверка расписания "
+                              "ошиблась: %s. Повторит сама позже." % e)
+            return
+        send(chat_id, "❌ Код не подошёл — вот новая картинка:")
+        cmd_unlock(send, chat_id, manual=False)
+        return
+    send(chat_id, "Сайт не дал проверить код за 2 минуты. "
+                  "Отправьте /unlock чуть позже.")
+
+
 def check_captcha_answer(send, conn, chat_id, code):
     c = SchedClient()
     try:
         resp = c.post_json(
             "schedule/api/api.php?act=Captcha&method=validateCaptcha",
             {"key": code.strip()})
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            send(chat_id, "⏳ Код получен, но сайт проверяет слишком часто — "
+                          "повторю автоматически через минуту, "
+                          "ничего не делайте.")
+            u = get_user(conn, chat_id)
+            gid = u[2] if u else 10706
+            threading.Thread(target=_retry_validation,
+                             args=(send, chat_id, code.strip(), gid),
+                             daemon=True).start()
+            return
+        send(chat_id, "⚠️ Ошибка проверки (HTTP %s). Вот новая капча:"
+             % e.code)
+        cmd_unlock(send, chat_id, manual=False)
+        return
     except Exception as e:
         # сеть дрогнула — капча не потрачена, просто вводим код заново
         send(chat_id, "⚠️ Не удалось проверить код (%s). Введите его ещё раз."
