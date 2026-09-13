@@ -174,24 +174,32 @@ def schedule_command(send, conn, chat_id, gid, gname, mode, day=None):
     def work():
         wconn = db()
         try:
-            try:
-                week = get_week(gid, day=day, max_age_min=None)
-            except CaptchaNeeded:
-                if auto_captcha_allow():
-                    send(chat_id, "🔒 Сайт просит подтверждение — "
-                                  "решите капчу:")
-                    cmd_unlock(send, chat_id, manual=False)
-                else:
-                    send(chat_id, "🔒 Сайт просит капчу. Автопоказ на "
-                                  "сегодня исчерпан — /unlock вручную.")
-                return
-            except Backoff:
-                send(chat_id, "⏳ Сайт университета недоступен — "
-                              "попробуйте позже.")
-                return
-            except Exception as e:
-                send(chat_id, "⚠️ Не удалось получить расписание (%s)."
-                     % str(e)[:60])
+            week = None
+            # терпеливо: сайт иногда "охлаждается" — фон дожимает до 20 минут
+            # и сам доставляет расписание, пользователю не нужно переспрашивать
+            for attempt in range(20):
+                try:
+                    week = get_week(gid, day=day, max_age_min=None)
+                    break
+                except CaptchaNeeded:
+                    if auto_captcha_allow():
+                        send(chat_id, "🔒 Сайт просит подтверждение — "
+                                      "решите капчу:")
+                        cmd_unlock(send, chat_id, manual=False)
+                    else:
+                        send(chat_id, "🔒 Сайт просит капчу. Автопоказ на "
+                                      "сегодня исчерпан — /unlock вручную.")
+                    return
+                except Backoff:
+                    last = "сайт недоступен"
+                except Exception as e:
+                    last = str(e)[:60]
+                if attempt < 19:
+                    time.sleep(60)
+            if week is None:
+                send(chat_id, "⏳ Сайт университета не отвечал 20 минут — "
+                              "попробуйте позже (напоминания работают "
+                              "независимо от этого).")
                 return
 
             if mode == "week":
