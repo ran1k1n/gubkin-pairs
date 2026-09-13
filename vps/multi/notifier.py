@@ -111,8 +111,17 @@ def main():
                     same_day = fdt.date() == today
                 except ValueError:
                     age_min, same_day = 10**9, False
-                need_refresh = (not same_day) or (
-                    age_min >= REFRESH_MIN and DAY_START <= t.hour < DAY_END)
+                # РОВНО 2 захода на сайт в сутки на группу (щадяще для WAF):
+                # утро — первое обновление дня, 13:00-13:59 — проверка отмен
+                if not same_day:
+                    need_refresh = 6 <= t.hour < 20 or t.hour < 2
+                elif (13 <= t.hour < 14
+                      and cache.get("pm_fetch") != today):
+                    need_refresh = True
+                else:
+                    need_refresh = False
+            else:
+                need_refresh = 6 <= t.hour < 20 or t.hour < 2
             week = get_week(gid,
                             force=need_refresh,
                             max_age_min=None if need_refresh else REFRESH_MIN)
@@ -162,6 +171,16 @@ def main():
         except Exception as e:
             log.error("группа %s: %s", gid, e)
             continue
+
+        if 13 <= t.hour < 14:
+            try:
+                import common
+                c2 = common.load_sched(gid)
+                if c2:
+                    c2["pm_fetch"] = today
+                    common.save_sched(gid, c2)
+            except Exception:
+                pass
 
         lessons_today = classes_on_date(week, t)
 
