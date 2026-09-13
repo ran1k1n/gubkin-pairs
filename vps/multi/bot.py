@@ -165,30 +165,72 @@ def kb_groups(fid):
     return {"inline_keyboard": rows}
 
 
-def send_week_preview(send, chat_id, group_id, group_name):
-    if needs_refresh(group_id):
+def schedule_command(send, conn, chat_id, gid, gname, mode, day=None):
+    """Ни одна команда не ждёт сайт: мгновенный ответ из кэша или
+    «загружаю…», а получение данных — в фоновом потоке."""
+    if needs_refresh(gid, day=day):
         send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
-    try:
-        week = get_week(group_id, max_age_min=None)
-    except CaptchaNeeded:
-        if auto_captcha_allow():
-            send(chat_id, "🔒 Сайт университета просит подтверждение — "
-                          "решите капчу, это займёт 20 секунд:")
-            cmd_unlock(send, chat_id, manual=False)
-        else:
-            send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
-                          "исчерпан — отправьте /unlock вручную.")
-        return
-    except Backoff:
-        send(chat_id, "⏳ Сайт университета недоступен — попробуйте позже.")
-        return
-    t = now()
-    today_les = classes_for(week, t)
-    wt = week_type_label(week)
-    header = "📅 %s, группа %s" % (day_label(t), group_name)
-    if wt:
-        header += " — неделя %s" % wt
-    send(chat_id, lessons_text(today_les, header))
+
+    def work():
+        wconn = db()
+        try:
+            try:
+                week = get_week(gid, day=day, max_age_min=None)
+            except CaptchaNeeded:
+                if auto_captcha_allow():
+                    send(chat_id, "🔒 Сайт просит подтверждение — "
+                                  "решите капчу:")
+                    cmd_unlock(send, chat_id, manual=False)
+                else:
+                    send(chat_id, "🔒 Сайт просит капчу. Автопоказ на "
+                                  "сегодня исчерпан — /unlock вручную.")
+                return
+            except Backoff:
+                send(chat_id, "⏳ Сайт университета недоступен — "
+                              "попробуйте позже.")
+                return
+            except Exception as e:
+                send(chat_id, "⚠️ Не удалось получить расписание (%s)."
+                     % str(e)[:60])
+                return
+
+            if mode == "week":
+                days = sorted({l["wd"] for l in week.get("lessons", [])
+                               if not l.get("cancelled")})
+                wd_by_num = {d["weekDayNumber"]: d["date"]
+                             for d in week.get("week_days", [])}
+                wt = week_type_label(week)
+                out = ["🗓 Неделя%s, группа %s"
+                       % (" (%s)" % wt if wt else "", gname)]
+                for wd in days:
+                    date_str = wd_by_num.get(wd)
+                    if not date_str:
+                        continue
+                    dd = __import__("datetime").datetime.strptime(
+                        date_str, "%d-%m-%Y")
+                    out.append("")
+                    out.append("— %s —" % day_label(dd))
+                    for l in classes_for(week, dd):
+                        if l.get("cancelled"):
+                            out.append("❌ %s отменена (%s)"
+                                       % (l["subject"], l["start"]))
+                        else:
+                            out.append("• "
+                                       + __import__("common").format_class(l))
+                send(chat_id, "\n".join(out)
+                     or "Расписание на неделю пустое.")
+                return
+
+            d = now() if mode == "today" else now() + timedelta(days=1)
+            wt = week_type_label(week)
+            header = "📅 %s, группа %s" % (day_label(d), gname)
+            if wt:
+                header += " — неделя %s" % wt
+            send(chat_id, lessons_text(classes_for(week, d), header))
+        finally:
+            wconn.close()
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def classes_for(week, day):
@@ -428,64 +470,12 @@ def handle_message(send, conn, msg):
                 send(chat_id, "⏳ Сайт университета не отвечает, попробуйте "
                               "через пару минут: /start")
     elif text.startswith("/today") and user:
-        send_week_preview(send, chat_id, user[2], user[3])
+        schedule_command(send, conn, chat_id, user[2], user[3], "today")
     elif text.startswith("/tomorrow") and user:
-        tomorrow = now() + timedelta(days=1)
-        if needs_refresh(user[2], day=tomorrow):
-            send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
-        try:
-            week = get_week(user[2], day=tomorrow, max_age_min=None)
-        except CaptchaNeeded:
-            if auto_captcha_allow():
-                send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
-                cmd_unlock(send, chat_id, manual=False)
-            else:
-                send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
-                              "исчерпан — отправьте /unlock вручную.")
-            return
-        except Backoff:
-            send(chat_id, "⏳ Сайт недоступен — попробуйте позже.")
-            return
-        d = now() + timedelta(days=1)
-        send(chat_id, lessons_text(classes_for(week, d),
-                                   "📅 Завтра, %s" % day_label(d)))
+        schedule_command(send, conn, chat_id, user[2], user[3], "tomorrow",
+                         day=now() + timedelta(days=1))
     elif text.startswith("/week") and user:
-        if needs_refresh(user[2]):
-            send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
-        try:
-            week = get_week(user[2], max_age_min=None)
-        except CaptchaNeeded:
-            if auto_captcha_allow():
-                send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
-                cmd_unlock(send, chat_id, manual=False)
-            else:
-                send(chat_id, "🔒 Сайт просит капчу. Автопоказ на сегодня "
-                              "исчерпан — отправьте /unlock вручную.")
-            return
-        except Backoff:
-            send(chat_id, "⏳ Сайт недоступен — попробуйте позже.")
-            return
-        days = sorted({l["wd"] for l in week.get("lessons", [])
-                       if not l.get("cancelled")})
-        wd_by_num = {d["weekDayNumber"]: d["date"] for d in week.get("week_days", [])}
-        wt = week_type_label(week)
-        out = ["🗓 Неделя%s, группа %s" % (" (%s)" % wt if wt else "",
-                                           user[3])]
-        for wd in days:
-            date_str = wd_by_num.get(wd)
-            if not date_str:
-                continue
-            dd = __import__("datetime").datetime.strptime(
-                date_str, "%d-%m-%Y")
-            les = classes_for(week, dd)
-            out.append("")
-            out.append("— %s —" % day_label(dd))
-            for l in les:
-                if l.get("cancelled"):
-                    out.append("❌ %s отменена (%s)" % (l["subject"], l["start"]))
-                else:
-                    out.append("• " + __import__("common").format_class(l))
-        send(chat_id, "\n".join(out) or "Расписание на неделю пустое.")
+        schedule_command(send, conn, chat_id, user[2], user[3], "week")
     elif text.startswith("/group"):
         kb = kb_faculties()
         if kb:
@@ -592,7 +582,7 @@ def handle_callback(send, conn, cb):
                    message_id=card["message_id"])
             except Exception as e:
                 log.warning("pin не удался: %s", e)
-        send_week_preview(send, chat_id, gid, code)
+        schedule_command(send, conn, chat_id, gid, code, "today")
 
 
 def main():
