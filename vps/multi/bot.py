@@ -13,7 +13,8 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
     auto_captcha_allow, day_label, get_user, manual_unlock_allow,
-    needs_refresh, pending_clear,
+    needs_refresh, pending_clear, pending_is,
+    pending_set, set_enabled, users_all, week_type_label,
     pending_is, pending_set,
     set_enabled, users_all,
     get_week, lessons_text, load_config, now, tg, CACHE_DIR)
@@ -180,8 +181,11 @@ def send_week_preview(send, chat_id, group_id, group_name):
         return
     t = now()
     today_les = classes_for(week, t)
-    send(chat_id, lessons_text(
-        today_les, "📅 %s, группа %s" % (day_label(t), group_name)))
+    wt = week_type_label(week)
+    header = "📅 %s, группа %s" % (day_label(t), group_name)
+    if wt:
+        header += " — неделя %s" % wt
+    send(chat_id, lessons_text(today_les, header))
 
 
 def classes_for(week, day):
@@ -353,10 +357,11 @@ def handle_message(send, conn, msg):
     elif text.startswith("/today") and user:
         send_week_preview(send, chat_id, user[2], user[3])
     elif text.startswith("/tomorrow") and user:
-        if needs_refresh(user[2]):
+        tomorrow = now() + timedelta(days=1)
+        if needs_refresh(user[2], day=tomorrow):
             send(chat_id, "⏳ Загружаю свежее расписание с сайта университета…")
         try:
-            week = get_week(user[2], max_age_min=None)
+            week = get_week(user[2], day=tomorrow, max_age_min=None)
         except CaptchaNeeded:
             if auto_captcha_allow():
                 send(chat_id, "🔒 Сайт просит подтверждение — решите капчу:")
@@ -390,7 +395,9 @@ def handle_message(send, conn, msg):
         days = sorted({l["wd"] for l in week.get("lessons", [])
                        if not l.get("cancelled")})
         wd_by_num = {d["weekDayNumber"]: d["date"] for d in week.get("week_days", [])}
-        out = ["🗓 Неделя, группа %s" % user[3]]
+        wt = week_type_label(week)
+        out = ["🗓 Неделя%s, группа %s" % (" (%s)" % wt if wt else "",
+                                           user[3])]
         for wd in days:
             date_str = wd_by_num.get(wd)
             if not date_str:

@@ -2,7 +2,11 @@
 """Общий код многопользовательского бота расписания Губкинского.
 
 Расписание группы — публичные данные: логин в ЛК не нужен, достаточно
-GET страницы /schedule/ той же сессией перед обращением к API (иначе WAF).
+GET страницы /schedule/ той же сессии перед обращением к API (иначе WAF).
+
+Важно: у Губкина чётные (верхние) и нечётные (нижние) недели различаются,
+поэтому кэш хранится РАЗДЕЛЬНО по неделям — get_week(group_id, day) всегда
+возвращает данные именно той недели, к которой относится day.
 """
 
 import http.cookiejar
@@ -11,7 +15,6 @@ import logging
 import re
 import sqlite3
 import subprocess
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,8 +30,8 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 LKH = "https://lk.gubkin.ru/"
 TZ = ZoneInfo("Europe/Moscow")
-HTTP_TIMEOUT = 40   # telegram/github
-SITE_TIMEOUT = 12   # lk.gubkin.ru: нормально отвечает за 0.1с; тarpit отвалится за 12с
+HTTP_TIMEOUT = 40    # telegram/github
+SITE_TIMEOUT = 12    # lk.gubkin.ru: в норме 0.1с; tarpit отвалится за 12с
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
@@ -56,7 +59,8 @@ def db():
         created_at TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1)""")
     try:
-        conn.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE users ADD COLUMN "
+                     "enabled INTEGER NOT NULL DEFAULT 1")
     except sqlite3.OperationalError:
         pass  # колонка уже есть
     return conn
@@ -82,10 +86,9 @@ def del_user(conn, chat_id):
 
 
 def get_user(conn, chat_id):
-    row = conn.execute(
-        "SELECT chat_id,username,group_id,group_name FROM users WHERE chat_id=?",
-        (chat_id,)).fetchone()
-    return row
+    return conn.execute(
+        "SELECT chat_id,username,group_id,group_name FROM users "
+        "WHERE chat_id=?", (chat_id,)).fetchone()
 
 
 def users_all(conn):
@@ -100,18 +103,18 @@ def users_by_group(conn):
     for chat_id, _u, gid, gname in conn.execute(
             "SELECT chat_id,username,group_id,group_name FROM users "
             "WHERE enabled=1"):
-        out.setdefault(gid, {"name": gname, "chats": []})["chats"].append(chat_id)
+        out.setdefault(gid, {"name": gname,
+                             "chats": []})["chats"].append(chat_id)
     return out
 
 
 # ---------------------------------------------------------------- http
 
 class SchedClient:
-    """Публичный клиент расписания (без логина). Помнит WAF-сессию.
-
-    Сессия ПЕРСИСТЕНТНА (cache/session_cookies.txt) и общая для бота и
-    рассыльщика: после решения капчи (см. /unlock в bot.py) все процессы
-    пользуются разблокированной сессией.
+    """Публичный клиент расписания (без логина). Сессия персистентна
+    (cache/session_cookies.txt) и общая для бота и рассыльщика: после
+    решения капчи (/unlock) все процессы пользуются разблокированной
+    сессией. Визит на /schedule/ нужен один раз на сессию, не на запрос.
     """
 
     SESSION_PATH = CACHE_DIR / "session_cookies.txt"
@@ -125,7 +128,8 @@ class SchedClient:
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar))
         self.opener.addheaders = [("User-Agent", UA),
-                                  ("Accept", "application/json, text/plain, */*")]
+                                  ("Accept",
+                                   "application/json, text/plain, */*")]
 
     def _has_session(self):
         return any(c.name == "PHPSESSID" for c in self.jar)
@@ -144,8 +148,6 @@ class SchedClient:
         return data
 
     def visit(self, force=False):
-        """Тяжёлая загрузка страницы нужна один раз на сессию (WAF);
-        если PHPSESSID уже в банке — пропускаем для скорости."""
         if not force and self._has_session():
             return
         self._get("schedule/")
@@ -155,7 +157,6 @@ class SchedClient:
         return json.loads(self._get(path, timeout).decode("utf-8", "replace"))
 
     def raw(self, path, timeout=SITE_TIMEOUT):
-        """Бинарный ответ (например, картинка капчи)."""
         return self._get(path, timeout)
 
     def post_json(self, path, payload, timeout=SITE_TIMEOUT):
@@ -168,9 +169,100 @@ class SchedClient:
         return json.loads(data.decode("utf-8", "replace"))
 
 
-# ---------------------------------------------------------------- кэш
+# ------------------------------------------------- state ожидания капчи
+
+PENDING_PATH = CACHE_DIR / "pending_captcha.json"
+
+
+def pending_load():
+    try:
+        return json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def pending_set(chat_id):
+    p = pending_load()
+    p[str(chat_id)] = now().isoformat()
+    PENDING_PATH.write_text(json.dumps(p), encoding="utf-8")
+
+
+def pending_clear(chat_id=None):
+    if chat_id is None:
+        PENDING_PATH.write_text("{}", encoding="utf-8")
+        return
+    p = pending_load()
+    p.pop(str(chat_id), None)
+    PENDING_PATH.write_text(json.dumps(p), encoding="utf-8")
+
+
+def pending_is(chat_id, max_age_min=180):
+    p = pending_load()
+    ts = p.get(str(chat_id))
+    if not ts:
+        return False
+    try:
+        return (now() - datetime.fromisoformat(ts)) <= timedelta(
+            minutes=max_age_min)
+    except ValueError:
+        return False
+
+
+# --------------------------------------------- лимиты показов капчи
+
+AUTO_CAPTCHA_PATH = CACHE_DIR / "auto_captcha.json"
+AUTO_CAPTCHA_LIMIT = 3
+
+
+def auto_captcha_allow(max_per_day=AUTO_CAPTCHA_LIMIT):
+    """True, если авто-показ капчи сегодня не исчерпан (и учитывает показ)."""
+    try:
+        st = json.loads(AUTO_CAPTCHA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    today = now().date().isoformat()
+    if st.get("date") != today:
+        st = {"date": today, "count": 0}
+    if st["count"] >= max_per_day:
+        AUTO_CAPTCHA_PATH.write_text(json.dumps(st), encoding="utf-8")
+        return False
+    st["count"] += 1
+    AUTO_CAPTCHA_PATH.write_text(json.dumps(st), encoding="utf-8")
+    return True
+
+
+MANUAL_UNLOCK_PATH = CACHE_DIR / "manual_unlock.json"
+MANUAL_UNLOCK_LIMIT = 15
+
+
+def manual_unlock_allow(max_per_day=MANUAL_UNLOCK_LIMIT):
+    """True, если ручных /unlock сегодня меньше 15 (и учитывает попытку)."""
+    try:
+        st = json.loads(MANUAL_UNLOCK_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    today = now().date().isoformat()
+    if st.get("date") != today:
+        st = {"date": today, "count": 0}
+    if st["count"] >= max_per_day:
+        MANUAL_UNLOCK_PATH.write_text(json.dumps(st), encoding="utf-8")
+        return False
+    st["count"] += 1
+    MANUAL_UNLOCK_PATH.write_text(json.dumps(st), encoding="utf-8")
+    return True
+
+
+# ---------------------------------------------------------------- backoff
 
 FETCH_STATE = CACHE_DIR / "fetch_state.json"
+
+
+class Backoff(Exception):
+    """Сайт недоступен/ошибка сети — повторить позже."""
+
+
+class CaptchaNeeded(Exception):
+    """Сайт ответил 429 «введите капчу» — нужен человек с /unlock."""
 
 
 def fetch_state():
@@ -210,100 +302,34 @@ def backoff_clear():
         fetch_state_save({"next_ok": None, "tries": 0})
 
 
-class Backoff(Exception):
-    """Сайт недоступен/ошибка сети — повторить позже."""
+# ---------------------------------------------------------------- кэш недель
+
+def week_key(day):
+    """Понедельник недели, к которой относится day (datetime/date)."""
+    d = day.date() if isinstance(day, datetime) else day
+    return (d - timedelta(days=d.weekday())).isoformat()
 
 
-class CaptchaNeeded(Exception):
-    """Сайт ответил 429 «введите капчу» — нужен человек с /unlock."""
+def sched_cache_path(gid, day=None):
+    """Кэш недели: текущая неделя — общий файл, другие — по понедельнику."""
+    if day is None:
+        return CACHE_DIR / ("sched_%s.json" % gid)
+    if week_key(day) == week_key(now()):
+        return CACHE_DIR / ("sched_%s.json" % gid)
+    return CACHE_DIR / ("sched_%s_%s.json" % (gid, week_key(day)))
 
 
-# ------------------------------------------- ожидание кода капчи (общий файл)
-
-PENDING_PATH = CACHE_DIR / "pending_captcha.json"
-
-
-def pending_load():
+def load_sched(gid, day=None):
     try:
-        return json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+        return json.loads(
+            sched_cache_path(gid, day).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return None
 
 
-def pending_set(chat_id):
-    """Отметить чат как ожидающий код капчи (файл — чтобы бот и
-    рассыльщик, запущенные как разные процессы, видели одно состояние)."""
-    p = pending_load()
-    p[str(chat_id)] = now().isoformat()
-    PENDING_PATH.write_text(json.dumps(p), encoding="utf-8")
-
-
-def pending_clear(chat_id=None):
-    """Снять отметку; без аргумента — у всех (капча разблокирует систему
-    целиком, остальным ждать кода больше не нужно)."""
-    if chat_id is None:
-        PENDING_PATH.write_text("{}", encoding="utf-8")
-        return
-    p = pending_load()
-    p.pop(str(chat_id), None)
-    PENDING_PATH.write_text(json.dumps(p), encoding="utf-8")
-
-
-def pending_is(chat_id, max_age_min=180):
-    p = pending_load()
-    ts = p.get(str(chat_id))
-    if not ts:
-        return False
-    try:
-        return (now() - datetime.fromisoformat(ts)) <= timedelta(
-            minutes=max_age_min)
-    except ValueError:
-        return False
-
-
-# ------------------------------------------- лимит авто-показов капчи в день
-
-AUTO_CAPTCHA_PATH = CACHE_DIR / "auto_captcha.json"
-AUTO_CAPTCHA_LIMIT = 3
-
-
-def auto_captcha_allow(max_per_day=AUTO_CAPTCHA_LIMIT):
-    """True, если авто-показ капчи сегодня ещё не исчерпан (и учитывает
-    показ). Ручной /unlock лимит не тратит и не проверяет."""
-    try:
-        st = json.loads(AUTO_CAPTCHA_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        st = {}
-    today = now().date().isoformat()
-    if st.get("date") != today:
-        st = {"date": today, "count": 0}
-    if st["count"] >= max_per_day:
-        AUTO_CAPTCHA_PATH.write_text(json.dumps(st), encoding="utf-8")
-        return False
-    st["count"] += 1
-    AUTO_CAPTCHA_PATH.write_text(json.dumps(st), encoding="utf-8")
-    return True
-
-
-MANUAL_UNLOCK_PATH = CACHE_DIR / "manual_unlock.json"
-MANUAL_UNLOCK_LIMIT = 15
-
-
-def manual_unlock_allow(max_per_day=MANUAL_UNLOCK_LIMIT):
-    """True, если ручных /unlock сегодня меньше 15 (и учитывает попытку)."""
-    try:
-        st = json.loads(MANUAL_UNLOCK_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        st = {}
-    today = now().date().isoformat()
-    if st.get("date") != today:
-        st = {"date": today, "count": 0}
-    if st["count"] >= max_per_day:
-        MANUAL_UNLOCK_PATH.write_text(json.dumps(st), encoding="utf-8")
-        return False
-    st["count"] += 1
-    MANUAL_UNLOCK_PATH.write_text(json.dumps(st), encoding="utf-8")
-    return True
+def save_sched(gid, data, day=None):
+    sched_cache_path(gid, day).write_text(
+        json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def _norm_week(raw, group_id):
@@ -320,117 +346,111 @@ def _norm_week(raw, group_id):
             tc = l.get("timeChunks") or []
             if not tc or tc[0] >= len(chunks):
                 continue
-            times = chunks[tc[0]].split("-")[0], chunks[tc[-1]].split("-")[-1]
+            times = (chunks[tc[0]].split("-")[0],
+                     chunks[tc[-1]].split("-")[-1])
             rooms = ", ".join(r.get("number", "")
-                              for r in (l.get("rooms") or []) if r.get("number"))
+                              for r in (l.get("rooms") or [])
+                              if r.get("number"))
             teachers = ", ".join(
                 t["lastName"] for t in (l.get("teachers") or [])
                 if isinstance(t, dict) and t.get("lastName"))
-            changes = l.get("changes") or []
             lessons.append({
                 "wd": l.get("weekDayNumber"),
                 "start": times[0], "end": times[1],
-                "subject": (l.get("course") or {}).get("name") or l.get("type") or "Занятие",
+                "subject": ((l.get("course") or {}).get("name")
+                            or l.get("type") or "Занятие"),
                 "kind": l.get("type"),
                 "room": rooms or None,
                 "teacher": teachers or None,
                 "cancelled": bool(l.get("isCanceled")),
                 "moved": bool(l.get("isMoved")),
-                "changed": bool(changes),
+                "changed": bool(l.get("changes")),
             })
     lessons.sort(key=lambda x: (x["wd"], x["start"]))
     return {"week_days": week_days, "lessons": lessons}
 
 
-def sched_cache_path(gid):
-    return CACHE_DIR / ("sched_%s.json" % gid)
+def get_week(group_id, day=None, force=False, max_age_min=None):
+    """Расписание недели, содержащей day (по умолчанию — сегодня).
 
-
-def load_sched(gid):
-    try:
-        return json.loads(sched_cache_path(gid).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
-def save_sched(gid, data):
-    sched_cache_path(gid).write_text(
-        json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-
-
-def get_week(group_id, max_age_min=None, force=False):
-    """Неделя группы из кэша; при необходимости — из сети.
-
-    max_age_min: если кэш старше — обновить (None = только сегодня).
-    Бросает Backoff, если сайт ограничивает и свежего кэша нет.
+    Недели хранятся раздельно: кэш верхней недели никогда не показывается
+    в нижнюю и наоборот. Бросает Backoff (сайт недоступен) или
+    CaptchaNeeded (429).
     """
-    cache = load_sched(group_id)
-    same_week = False
+    if day is None:
+        day = now()
+    day = day.date() if isinstance(day, datetime) else day
+    date_str = day.strftime("%d-%m-%Y")
+    cache = load_sched(group_id, day)
+    covers_day = bool(cache and any(
+        d.get("date") == date_str for d in cache.get("week_days", [])))
     fresh = False
     if cache:
-        fetched = cache.get("fetched_at", "")
         try:
-            fdt = datetime.fromisoformat(fetched)
-            age = now() - fdt
-            fresh = age <= timedelta(minutes=max_age_min or 0)
-            same_week = any(d.get("date") == now().strftime("%d-%m-%Y")
-                            for d in cache.get("week_days", []))
+            fresh = (now() - datetime.fromisoformat(
+                cache.get("fetched_at", ""))) <= timedelta(
+                minutes=max_age_min or 0)
         except ValueError:
             pass
-    if cache and not force and (fresh or (same_week and max_age_min is None
-                                          and fetched[:10] == now().date().isoformat())):
+    if (cache and covers_day and not force
+            and (fresh or cache.get("fetched_at", "")[:10]
+                 == now().date().isoformat())):
         return cache
     if backoff_active():
-        if cache and same_week:
-            return cache  # устаревший, но лучше, чем ничего
+        if covers_day:
+            return cache
         raise Backoff()
     c = SchedClient()
     try:
         c.visit()
-        raw = c.api("schedule/api/api.php?act=schedule&date=%d-%d-%d&groupId=%s"
-                    % (now().day, now().month, now().year, group_id))
+        raw = c.api(
+            "schedule/api/api.php?act=schedule&date=%d-%d-%d&groupId=%s"
+            % (day.day, day.month, day.year, group_id))
     except urllib.error.HTTPError as e:
-        # 429 — просит капчу; 418/403/5xx — WAF-бан или сбой: любой враждебный
-        # ответ означаем как «сайт недоступен», но кэш отдаём мгновенно
+        # 429 — просит капчу; 418/403/5xx — WAF-бан: отдаём кэш мгновенно
         if e.code == 429:
             wait = backoff_register()
             log.warning("429, пауза %d мин", wait)
-            if cache and same_week:
+            if covers_day:
                 return cache
             raise CaptchaNeeded()
         log.warning("сайт ответил HTTP %s — считаю недоступным", e.code)
         backoff_register()
-        if cache and same_week:
+        if covers_day:
             return cache
         raise Backoff()
     except (urllib.error.URLError, ValueError, OSError) as e:
         log.warning("сеть: %s", e)
-        if cache and same_week:
+        if covers_day:
             return cache
         raise Backoff()
     backoff_clear()
-    prev = cache if (cache and same_week) else None
-    data = {"fetched_at": now().isoformat(), "group_id": group_id}
+    prev = cache if covers_day else None
+    data = {"fetched_at": now().isoformat(), "group_id": group_id,
+            "week_type": ((raw.get("rows") or {}).get("week") or {})
+            .get("weekRussia", {}).get("type")}
     data.update(_norm_week(raw, group_id))
     if prev:
         data["prev_lessons"] = prev.get("lessons", [])
-    save_sched(group_id, data)
+    save_sched(group_id, data, day)
     return data
 
 
-def needs_refresh(gid, max_age_min=None):
-    """True, если следующий get_week пойдёт в сеть (кэша нет/устарел) —
-    боты используют, чтобы предупредить пользователя о загрузке."""
-    cache = load_sched(gid)
+def needs_refresh(gid, day=None, max_age_min=None):
+    """True, если следующий get_week пойдёт в сеть (кэша нет/устарел)."""
+    if day is None:
+        day = now()
+    day = day.date() if isinstance(day, datetime) else day
+    date_str = day.strftime("%d-%m-%Y")
+    cache = load_sched(gid, day)
     if not cache:
+        return True
+    if not any(d.get("date") == date_str
+               for d in cache.get("week_days", [])):
         return True
     try:
         fdt = datetime.fromisoformat(cache.get("fetched_at", ""))
     except ValueError:
-        return True
-    same_week = any(d.get("date") == now().strftime("%d-%m-%Y")
-                    for d in cache.get("week_days", []))
-    if not same_week:
         return True
     if max_age_min is not None:
         return (now() - fdt) > timedelta(minutes=max_age_min)
@@ -438,40 +458,24 @@ def needs_refresh(gid, max_age_min=None):
 
 
 def classes_on_date(week, day):
-    """Занятия на дату (datetime) из нормализованной недели."""
-    date_str = day.strftime("%d-%m-%Y")
+    """Занятия на дату (datetime/date) из нормализованной недели."""
+    d = day.date() if isinstance(day, datetime) else day
+    date_str = d.strftime("%d-%m-%Y")
     wd = None
-    for d in week.get("week_days", []):
-        if d.get("date") == date_str:
-            wd = d.get("weekDayNumber")
+    for dd in week.get("week_days", []):
+        if dd.get("date") == date_str:
+            wd = dd.get("weekDayNumber")
             break
     if wd is None:
         return []
     return [l for l in week.get("lessons", []) if l.get("wd") == wd]
 
 
-def format_class(c, with_time=True):
-    parts = []
-    if with_time:
-        parts.append("%s–%s" % (c["start"], c["end"]))
-    title = c["subject"] + (" (%s)" % c["kind"] if c.get("kind") else "")
-    parts.append(title)
-    extra = []
-    if c.get("room"):
-        extra.append("ауд. " + c["room"])
-    if c.get("teacher"):
-        extra.append(c["teacher"])
-    if extra:
-        parts.append(", ".join(extra))
-    return " — ".join(parts[:2]) + ((" | " + ", ".join(extra)) if extra else "")
-
-
 # ---------------------------------------------------------------- telegram
 
 def tg(api_method, token, files=None, **params):
     """Вызов Bot API через curl (Happy Eyeballs обходит зависания
-    отдельных IP api.telegram.org с Aeza; urllib в таких случаях молчит
-    до таймаута). files: {поле: (filename, bytes)} — multipart-выгрузка."""
+    отдельных IP api.telegram.org). files: {поле: (filename, bytes)}."""
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
     long_poll = api_method == "getUpdates"
     cmd = ["curl", "-s", "--connect-timeout", "4",
@@ -482,7 +486,8 @@ def tg(api_method, token, files=None, **params):
         tmps = []
         try:
             for name, (fname, data) in files.items():
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+                tmp = tempfile.NamedTemporaryFile(delete=False,
+                                                  suffix=".bin")
                 tmp.write(data)
                 tmp.close()
                 tmps.append(tmp.name)
@@ -515,8 +520,8 @@ def tg(api_method, token, files=None, **params):
 
 
 class Sender:
-    """Отправка с локальным очередями повторов (Telegram с VPS бывает
-    нестабилен — ретраим в следующих прогонах)."""
+    """Отправка с локальной очередью повторов (Telegram с VPS бывает
+    нестабилен — недоставленное уходит в cache/pending_sends.json)."""
 
     QUEUE = CACHE_DIR / "pending_sends.json"
 
@@ -547,11 +552,13 @@ class Sender:
         except Exception as e:
             log.warning("send %s не удался (%s) — в очередь", chat_id, e)
             try:
-                pending = json.loads(self.QUEUE.read_text(encoding="utf-8"))
+                pending = json.loads(
+                    self.QUEUE.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 pending = []
             pending.append({"chat_id": chat_id, "text": text})
-            self.QUEUE.write_text(json.dumps(pending[-500:]), encoding="utf-8")
+            self.QUEUE.write_text(json.dumps(pending[-500:]),
+                                  encoding="utf-8")
             return False
 
     def broadcast(self, chat_ids, text):
@@ -559,7 +566,7 @@ class Sender:
             self.send(cid, text)
 
 
-# ---------------------------------------------------------------- служебное
+# ---------------------------------------------------------------- утилиты
 
 def hhmm(s):
     m = re.match(r"^(\d{1,2}):(\d{2})", str(s).strip())
@@ -567,10 +574,34 @@ def hhmm(s):
 
 
 def day_label(day):
-    return day.strftime("%d.%m (%a)").replace("Monday", "пн").replace(
-        "Tuesday", "вт").replace("Wednesday", "ср").replace(
-        "Thursday", "чт").replace("Friday", "пт").replace(
-        "Saturday", "сб").replace("Sunday", "вс")
+    name = day.strftime("%d.%m (%a)")
+    for en, ru in (("Mon", "пн"), ("Tue", "вт"), ("Wed", "ср"),
+                   ("Thu", "чт"), ("Fri", "пт"), ("Sat", "сб"),
+                   ("Sun", "вс")):
+        name = name.replace(en, ru)
+    return name
+
+
+def week_type_label(week):
+    t = week.get("week_type")
+    return {"upper": "верхняя (нечётная)",
+            "lower": "нижняя (чётная)"}.get(t, "")
+
+
+def format_class(c, with_time=True):
+    parts = []
+    if with_time:
+        parts.append("%s–%s" % (c["start"], c["end"]))
+    title = c["subject"] + (" (%s)" % c["kind"] if c.get("kind") else "")
+    parts.append(title)
+    extra = []
+    if c.get("room"):
+        extra.append("ауд. " + c["room"])
+    if c.get("teacher"):
+        extra.append(c["teacher"])
+    if extra:
+        parts.append(", ".join(extra))
+    return " — ".join(parts[:2]) + ((" | " + ", ".join(extra)) if extra else "")
 
 
 def lessons_text(lessons, header):
