@@ -523,12 +523,11 @@ def classes_on_date(week, day):
 TG_IP_PATH = CACHE_DIR / "tg_ip.txt"
 
 
-def _tg_ip():
+def _tg_ips():
     try:
-        ip = TG_IP_PATH.read_text().strip()
-        return ip or None
+        return TG_IP_PATH.read_text().split()
     except OSError:
-        return None
+        return []
 
 
 def _tg_find_ip():
@@ -545,7 +544,10 @@ def _tg_find_ip():
         ip = info[4][0]
         if ip not in ips:
             ips.append(ip)
+    good = []
     for ip in ips:
+        if len(good) >= 3:
+            break
         try:
             r = subprocess.run(
                 ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
@@ -554,11 +556,12 @@ def _tg_find_ip():
                  "https://api.telegram.org/"],
                 capture_output=True, timeout=8)
             if r.stdout.decode().strip() in ("200", "302"):
-                TG_IP_PATH.write_text(ip)
-                return ip
+                good.append(ip)
         except Exception:
             continue
-    return None
+    if good:
+        TG_IP_PATH.write_text(" ".join(good))
+    return good[0] if good else None
 
 
 def tg(api_method, token, files=None, **params):
@@ -570,10 +573,11 @@ def tg(api_method, token, files=None, **params):
     cmd = ["curl", "-s", "--connect-timeout", "3",
            "--max-time", "45" if long_poll else "15",
            "--retry", "1", "--retry-all-errors"]
-    ip = _tg_ip()
-    if not ip:
-        ip = _tg_find_ip()
-    if ip:
+    ips = _tg_ips()
+    if not ips:
+        found = _tg_find_ip()
+        ips = [found] if found else []
+    for ip in ips[:4]:
         cmd += ["--resolve", "api.telegram.org:443:%s" % ip]
     if files:
         import tempfile
@@ -619,6 +623,19 @@ def tg(api_method, token, files=None, **params):
             except ValueError:
                 cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
             r = subprocess.run(cmd, capture_output=True, timeout=35)
+            body = r.stdout.decode("utf-8", "replace")
+    if not body and ips:
+        try:
+            TG_IP_PATH.unlink()
+        except OSError:
+            pass
+        fresh = _tg_find_ip()  # перепроверяет все IP, сохраняет живые
+        fresh_ips = _tg_ips()
+        if fresh_ips:
+            cmd = [x for x in cmd if not x.startswith("api.telegram.org:443:")]
+            for ip in fresh_ips[:4]:
+                cmd += ["--resolve", "api.telegram.org:443:%s" % ip]
+            r = subprocess.run(cmd, capture_output=True, timeout=90)
             body = r.stdout.decode("utf-8", "replace")
     if not body:
         raise RuntimeError("telegram %s: пустой ответ" % api_method)
