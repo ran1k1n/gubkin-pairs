@@ -51,6 +51,7 @@ def main():
     st = load_state()
     t = now()
     problems = []
+    repairs = []
 
     # 1) сервис бота
     r = subprocess.run(["systemctl", "is-active", "gubkin-bot"],
@@ -111,7 +112,37 @@ def main():
     except (OSError, ValueError):
         pass
 
-    # 5) ежедневный статус в 21:00
+    # 5) попытка протолкнуть очередь недоставленных сообщений
+    try:
+        sender._flush_queue()
+    except Exception:
+        pass
+
+    # 6) если сайт доступен, а кэши групп устарели — обновить их сам
+    try:
+        import common
+        probe = common.SchedClient()
+        probe.visit()
+        probe.api("schedule/api/api.php?act=meta")
+        site_ok = True
+    except Exception:
+        site_ok = False
+    if site_ok:
+        fixed = 0
+        for gid, info in groups.items():
+            try:
+                if common.needs_refresh(gid):
+                    common.get_week(gid, force=True, max_age_min=None)
+                    fixed += 1
+                    time.sleep(4)
+            except Exception:
+                pass
+        if fixed:
+            entry = "repair %s: обновил %d групп" % (
+                now().strftime("%F %H:%M"), fixed)
+            repairs.append(entry)
+
+    # 7) ежедневный статус в 21:00
     day_key = "digest:%s" % t.date().isoformat()
     if t.hour == 21 and not st.get(day_key):
         st[day_key] = 1
@@ -125,6 +156,10 @@ def main():
             sender.send(admin, text)
         save_state(st)
         return
+
+    if repairs:
+        with open(CACHE_DIR / "selfrepair.log", "a", encoding="utf-8") as f:
+            f.write("\n".join(repairs) + "\n")
 
     if problems:
         for p in problems:
