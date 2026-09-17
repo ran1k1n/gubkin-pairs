@@ -523,18 +523,21 @@ def classes_on_date(week, day):
 TG_IP_PATH = CACHE_DIR / "tg_ip.txt"
 
 
-def _tg_ips():
+def _tg_ip():
     try:
-        return TG_IP_PATH.read_text().split()
+        ip = TG_IP_PATH.read_text().strip()
+        return ip or None
     except OSError:
-        return []
+        return None
 
 
 def _tg_find_ip():
-    """Ищет IP api.telegram.org, который РЕАЛЬНО отвечает по HTTPS
-    (TCP-коннект есть и у таких, что виснут на SNI-фильтрации)."""
+    """Замеряет каждый IP api.telegram.org реальным HTTPS-запросом
+    и возвращает САМЫЙ БЫСТРЫЙ (часть адресов зависает на SNI-фильтре,
+    часть просто медленная — разница до 10 секунд на сообщение)."""
     import socket
     import subprocess
+    import time as _t
     try:
         infos = socket.getaddrinfo("api.telegram.org", 443, socket.AF_INET)
     except OSError:
@@ -544,40 +547,41 @@ def _tg_find_ip():
         ip = info[4][0]
         if ip not in ips:
             ips.append(ip)
-    good = []
+    scored = []
     for ip in ips:
-        if len(good) >= 3:
-            break
+        t0 = _t.time()
         try:
             r = subprocess.run(
                 ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
                  "--resolve", "api.telegram.org:443:%s" % ip,
-                 "--connect-timeout", "3", "--max-time", "6",
+                 "--connect-timeout", "3", "--max-time", "5",
                  "https://api.telegram.org/"],
-                capture_output=True, timeout=8)
-            if r.stdout.decode().strip() in ("200", "302"):
-                good.append(ip)
+                capture_output=True, timeout=7)
+            dt = _t.time() - t0
+            if r.stdout.decode().strip() in ("200", "302") and dt < 5:
+                scored.append((dt, ip))
         except Exception:
             continue
-    if good:
-        TG_IP_PATH.write_text(" ".join(good))
-    return good[0] if good else None
+    if not scored:
+        return None
+    scored.sort()
+    best = scored[0][1]
+    TG_IP_PATH.write_text(best)
+    return best
 
 
 def tg(api_method, token, files=None, **params):
-    """Вызов Bot API через curl. Живой IP api.telegram.org закрепляется
-    (--resolve): у Aeza часть адресов TG лежит — перебор каждый раз
-    стоил секунд на каждое сообщение."""
+    """Вызов Bot API через curl с закреплённым самым быстрым IP.
+    При сбое — автоматический переиск и один повтор."""
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
     long_poll = api_method == "getUpdates"
     cmd = ["curl", "-s", "--connect-timeout", "3",
            "--max-time", "45" if long_poll else "15",
            "--retry", "1", "--retry-all-errors"]
-    ips = _tg_ips()
-    if not ips:
-        found = _tg_find_ip()
-        ips = [found] if found else []
-    for ip in ips[:4]:
+    ip = _tg_ip()
+    if not ip:
+        ip = _tg_find_ip()
+    if ip:
         cmd += ["--resolve", "api.telegram.org:443:%s" % ip]
     if files:
         import tempfile
@@ -593,7 +597,7 @@ def tg(api_method, token, files=None, **params):
             for k, v in params.items():
                 cmd += ["-F", "%s=%s" % (k, v)]
             cmd.append(url)
-            r = subprocess.run(cmd, capture_output=True, timeout=35)
+            r = subprocess.run(cmd, capture_output=True, timeout=60)
         finally:
             import os
             for p in tmps:
@@ -607,35 +611,20 @@ def tg(api_method, token, files=None, **params):
                 v = json.dumps(v, ensure_ascii=False)
             cmd += ["--data-urlencode", "%s=%s" % (k, v)]
         cmd.append(url)
-        r = subprocess.run(cmd, capture_output=True, timeout=35)
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
     body = r.stdout.decode("utf-8", "replace")
-    if not body and ip:
-        # закреплённый IP перестал работать — переищем и повторим один раз
+    if not body:
+        # IP перестал отвечать — переиск и один повтор
         try:
             TG_IP_PATH.unlink()
         except OSError:
             pass
         ip2 = _tg_find_ip()
-        if ip2:
-            try:
-                cmd[cmd.index("--resolve") + 1] = \
-                    "api.telegram.org:443:%s" % ip2
-            except ValueError:
-                cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
-            r = subprocess.run(cmd, capture_output=True, timeout=35)
-            body = r.stdout.decode("utf-8", "replace")
-    if not body and ips:
-        try:
-            TG_IP_PATH.unlink()
-        except OSError:
-            pass
-        fresh = _tg_find_ip()  # перепроверяет все IP, сохраняет живые
-        fresh_ips = _tg_ips()
-        if fresh_ips:
-            cmd = [x for x in cmd if not x.startswith("api.telegram.org:443:")]
-            for ip in fresh_ips[:4]:
-                cmd += ["--resolve", "api.telegram.org:443:%s" % ip]
-            r = subprocess.run(cmd, capture_output=True, timeout=90)
+        if ip2 and ip2 != ip:
+            cmd = [x for x in cmd if not str(x).startswith(
+                "api.telegram.org:443:")]
+            cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
+            r = subprocess.run(cmd, capture_output=True, timeout=60)
             body = r.stdout.decode("utf-8", "replace")
     if not body:
         raise RuntimeError("telegram %s: пустой ответ" % api_method)
