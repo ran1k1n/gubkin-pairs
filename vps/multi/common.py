@@ -460,6 +460,17 @@ def get_week(group_id, day=None, force=False, max_age_min=None):
         if covers_day:
             return cache
         raise Backoff()
+    # сайт может ответить 200 с state=false (отказ/капча без HTTP-кода) —
+    # такое нельзя кэшировать как «пустую неделю»
+    if raw.get("state") is not True:
+        reason = str(raw.get("reason", ""))[:80]
+        log.warning("сайт: state=false (%s)", reason)
+        backoff_register()
+        if covers_day:
+            return cache
+        if "капч" in reason.lower():
+            raise CaptchaNeeded()
+        raise Backoff()
     backoff_clear()
     prev = cache if covers_day else None
     data = {"fetched_at": now().isoformat(), "group_id": group_id,

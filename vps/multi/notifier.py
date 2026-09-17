@@ -46,8 +46,11 @@ def save_sent(sent):
     SENT_PATH.write_text(json.dumps(sent), encoding="utf-8")
 
 
-def lesson_key(l):
-    return "%s:%s" % (l.get("start"), (l.get("subject") or "")[:40])
+def lesson_key(l, with_time=True):
+    base = "%s:%s" % (l.get("wd"), (l.get("subject") or "").lower()[:40])
+    if with_time:
+        base += ":%s" % l.get("start")
+    return base
 
 
 def main():
@@ -183,31 +186,61 @@ def main():
                 pass
 
         lessons_today = classes_on_date(week, t)
+        today_wd = None
+        for d in week.get("week_days", []):
+            if d.get("date") == t.strftime("%d-%m-%Y"):
+                today_wd = d.get("weekDayNumber")
+                break
 
-        # --- отмены/изменения (diff с предыдущим снимком той же недели)
+        # --- сравнение с утренним снимком: отмены, переносы, добавления
         prev = cache.get("prev_lessons") if cache else None
         if prev:
-            prev_map = {lesson_key(l): l for l in prev}
-            for l in lessons_today:
-                old = prev_map.get(lesson_key(l))
-                if old and not old.get("cancelled") and l.get("cancelled"):
-                    key = "cancel:%s:%s:%s:%s" % (gid, today_key,
-                                                  l["start"], lesson_key(l))
+            prev_today = [l for l in prev
+                          if l.get("wd") == today_wd]
+            prev_map = {lesson_key(l, with_time=False): l
+                        for l in prev_today}
+            cur_map = {lesson_key(l, with_time=False): l
+                       for l in lessons_today}
+            for k, old in prev_map.items():
+                new = cur_map.get(k)
+                if new is None:
+                    key = "gone:%s:%s:%s" % (gid, today_key, k)
+                    if key not in sent and not old.get("cancelled"):
+                        sent[key] = 1
+                        sender.broadcast(chats,
+                            "➖ Пара исчезла из расписания (%s): %s"
+                            % (old.get("start"), format_simple(old)))
+                    continue
+                if not old.get("cancelled") and new.get("cancelled"):
+                    key = "cancel:%s:%s:%s" % (gid, today_key, k)
                     if key not in sent:
                         sent[key] = 1
-                        sender.broadcast(
-                            chats,
-                            "❌ Отменена пара %s\n%s" % (
-                                l["start"], format_simple(l)))
-                elif old and not old.get("changed") and l.get("changed"):
-                    key = "change:%s:%s:%s:%s" % (gid, today_key,
-                                                  l["start"], lesson_key(l))
+                        sender.broadcast(chats,
+                            "❌ Отменена пара %s\n%s"
+                            % (new.get("start"), format_simple(new)))
+                elif old.get("start") != new.get("start"):
+                    key = "move:%s:%s:%s" % (gid, today_key, k)
                     if key not in sent:
                         sent[key] = 1
-                        sender.broadcast(
-                            chats,
-                            "⚠️ Изменения в паре %s\n%s" % (
-                                l["start"], format_simple(l)))
+                        sender.broadcast(chats,
+                            "🔁 Пару перенесли: было %s, стало %s\n%s"
+                            % (old.get("start"), new.get("start"),
+                               format_simple(new)))
+                elif not old.get("changed") and new.get("changed"):
+                    key = "chg:%s:%s:%s" % (gid, today_key, k)
+                    if key not in sent:
+                        sent[key] = 1
+                        sender.broadcast(chats,
+                            "⚠️ Изменения в паре %s\n%s"
+                            % (new.get("start"), format_simple(new)))
+            for k, new in cur_map.items():
+                if k not in prev_map and not new.get("cancelled"):
+                    key = "add:%s:%s:%s" % (gid, today_key, k)
+                    if key not in sent:
+                        sent[key] = 1
+                        sender.broadcast(chats,
+                            "➕ Добавлена пара %s\n%s"
+                            % (new.get("start"), format_simple(new)))
 
         # предзагрузка следующей недели: в воскресенье «завтра» уже
         # относится к новой неделе, и /tomorrow должен работать
