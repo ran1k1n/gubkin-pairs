@@ -90,7 +90,15 @@ def main():
             stale.append("%s: кэш повреждён" % info["name"])
     if stale:
         key = "stale_alert"
-        if not st.get(key) or (t - st[key]).total_seconds() > 86400:
+        prev_alert = st.get(key)
+        too_soon = False
+        if prev_alert:
+            try:
+                pdt = __import__("datetime").datetime.fromisoformat(prev_alert)
+                too_soon = (t - pdt).total_seconds() < 86400
+            except ValueError:
+                too_soon = False
+        if not too_soon:
             st[key] = t.isoformat()
             problems.append("🗓 Университет держит блокировку, данные "
                             "устарели:\n" + "\n".join("• " + s for s in stale)
