@@ -589,7 +589,7 @@ def tg(api_method, token, files=None, **params):
             for k, v in params.items():
                 cmd += ["-F", "%s=%s" % (k, v)]
             cmd.append(url)
-            r = subprocess.run(cmd, capture_output=True, timeout=60)
+            r = subprocess.run(cmd, capture_output=True, timeout=35)
         finally:
             import os
             for p in tmps:
@@ -603,7 +603,7 @@ def tg(api_method, token, files=None, **params):
                 v = json.dumps(v, ensure_ascii=False)
             cmd += ["--data-urlencode", "%s=%s" % (k, v)]
         cmd.append(url)
-        r = subprocess.run(cmd, capture_output=True, timeout=60)
+        r = subprocess.run(cmd, capture_output=True, timeout=35)
     body = r.stdout.decode("utf-8", "replace")
     if not body and ip:
         # закреплённый IP перестал работать — переищем и повторим один раз
@@ -618,7 +618,7 @@ def tg(api_method, token, files=None, **params):
                     "api.telegram.org:443:%s" % ip2
             except ValueError:
                 cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
-            r = subprocess.run(cmd, capture_output=True, timeout=60)
+            r = subprocess.run(cmd, capture_output=True, timeout=35)
             body = r.stdout.decode("utf-8", "replace")
     if not body:
         raise RuntimeError("telegram %s: пустой ответ" % api_method)
