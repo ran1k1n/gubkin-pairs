@@ -576,8 +576,7 @@ def tg(api_method, token, files=None, **params):
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
     long_poll = api_method == "getUpdates"
     cmd = ["curl", "-s", "--connect-timeout", "3",
-           "--max-time", "45" if long_poll else "15",
-           "--retry", "1", "--retry-all-errors"]
+           "--max-time", "45" if long_poll else "8"]
     ip = _tg_ip()
     if not ip:
         ip = _tg_find_ip()
@@ -619,13 +618,20 @@ def tg(api_method, token, files=None, **params):
             TG_IP_PATH.unlink()
         except OSError:
             pass
-        ip2 = _tg_find_ip()
-        if ip2 and ip2 != ip:
-            cmd = [x for x in cmd if not str(x).startswith(
-                "api.telegram.org:443:")]
-            cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
+        fresh = _tg_find_ip()  # параллельный замер, сохраняет топ живых
+        fresh_ips = _tg_ips()[:2]
+        if fresh_ips:
+            cmd = [x for x in cmd if not x.startswith("api.telegram.org:443:")]
+            for ip2 in fresh_ips:
+                cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
             r = subprocess.run(cmd, capture_output=True, timeout=60)
             body = r.stdout.decode("utf-8", "replace")
+        # IP перестал отвечать — сбрасываем пин; следующий вызов
+        # сам параллельным замером найдёт самый быстрый живой IP
+        try:
+            TG_IP_PATH.unlink()
+        except OSError:
+            pass
     if not body:
         # висение без ответа: чаще всего сообщение ДОСТАВЛЕНО, а потерян
         # только ответ. Повтор = дубль у пользователя. Считаем успехом.
@@ -652,6 +658,8 @@ class Sender:
             pending = json.loads(self.QUEUE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pending = []
+        if not isinstance(pending, list):
+            pending = []
         if not pending:
             return
         still = []
@@ -673,6 +681,8 @@ class Sender:
                 pending = json.loads(
                     self.QUEUE.read_text(encoding="utf-8"))
             except (OSError, ValueError):
+                pending = []
+            if not isinstance(pending, list):
                 pending = []
             pending.append({"chat_id": chat_id, "text": text})
             self.QUEUE.write_text(json.dumps(pending[-500:]),

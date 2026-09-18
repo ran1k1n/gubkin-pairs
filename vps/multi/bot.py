@@ -619,16 +619,28 @@ def main():
         params = {"chat_id": chat_id, "text": text}
         if reply_markup:
             params["reply_markup"] = reply_markup
-        for attempt in range(3):
+        # одна быстрая попытка; при сбое — в очередь ретранслятора
+        # (Mac доставит за ~2 минуты). Никаких 30-секундных висений.
+        try:
+            return tg("sendMessage", TOKEN, **params)
+        except Exception as e:
+            log.warning("sendMessage не удался: %s — в очередь", e)
             try:
-                return tg("sendMessage", TOKEN, **params)
-            except Exception as e:
-                log.warning("sendMessage: %s (попытка %d)", e, attempt + 1)
-                time.sleep(2)
+                q = json.loads(PENDING_OUT.read_text(encoding="utf-8")) \
+                    if PENDING_OUT.exists() else []
+                q.append({"chat_id": chat_id, "text": text})
+                PENDING_OUT.write_text(
+                    json.dumps(q[-500:], ensure_ascii=False),
+                    encoding="utf-8")
+            except Exception as e2:
+                log.warning("очередь тоже не удалась: %s", e2)
+            return None
         # канал мёртв — сообщение в очередь, её разносит Mac-ретранслятор
         try:
             q = json.loads(PENDING_OUT.read_text(encoding="utf-8")) \
                 if PENDING_OUT.exists() else []
+            if not isinstance(q, list):
+                q = []
             q.append({"chat_id": chat_id, "text": text})
             PENDING_OUT.write_text(
                 json.dumps(q[-500:], ensure_ascii=False), encoding="utf-8")
