@@ -682,7 +682,17 @@ def main():
             uconn = db()
             try:
                 if "message" in upd:
-                    handle_message(send, uconn, upd["message"])
+                    m = upd["message"]
+                    chat_id = m.get("chat", {}).get("id")
+                    text = (m.get("text") or "").strip()
+                    # мгновенная плашка «жив» на каждую команду
+                    if (chat_id and text.startswith("/")
+                            and get_user(uconn, chat_id)):
+                        try:
+                            send(chat_id, "⚙️ Принял, работаю…")
+                        except Exception:
+                            pass
+                    handle_message(send, uconn, m)
                 elif "callback_query" in upd:
                     handle_callback(send, uconn, upd["callback_query"])
             except Exception:
