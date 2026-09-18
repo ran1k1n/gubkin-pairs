@@ -253,6 +253,18 @@ def main():
             except Exception as e:
                 log.warning("предзагрузка %s: %s", gid, e)
 
+        # поздняя сводка: если утреннее окно пропущено (блок сайта),
+        # а данные за сегодня только что добыты — шлём сразу
+        skey_late = "summary:%s:%s" % (gid, today_key)
+        if (same_day and skey_late not in sent and skey_late not in sent
+                and "summary:%s:%s" % (gid, today_key) not in sent
+                and t.hour >= 9):
+            sent[skey_late] = 1
+            sender.broadcast(chats, lessons_text(
+                lessons_today,
+                "🌅 Пары на сегодня, группа %s (с задержкой — сайт был "
+                "недоступен утром)" % gname))
+
         live = [l for l in lessons_today if not l.get("cancelled")]
 
         # --- утренняя сводка
