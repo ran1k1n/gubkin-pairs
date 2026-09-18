@@ -627,7 +627,11 @@ def tg(api_method, token, files=None, **params):
             r = subprocess.run(cmd, capture_output=True, timeout=60)
             body = r.stdout.decode("utf-8", "replace")
     if not body:
-        raise RuntimeError("telegram %s: пустой ответ" % api_method)
+        # висение без ответа: чаще всего сообщение ДОСТАВЛЕНО, а потерян
+        # только ответ. Повтор = дубль у пользователя. Считаем успехом.
+        log.warning("telegram %s: пустой ответ — считаю доставленным "
+                    "(антидубль)", api_method)
+        return {"ok": True, "ambiguous": True}
     d = json.loads(body)
     if d.get("ok") is not True:
         raise RuntimeError("telegram %s: %s" % (api_method, d))

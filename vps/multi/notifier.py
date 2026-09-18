@@ -40,7 +40,8 @@ def load_sent():
     except (OSError, ValueError):
         data = {}
     today = now().date().isoformat()
-    return {k: v for k, v in data.items() if k.endswith(today) or ":" not in k}
+    # дата в ключах стоит в середине (move:gid:ДАТА:...) — фильтр по вхождению
+    return {k: v for k, v in data.items() if today in k}
 
 
 def save_sent(sent):
