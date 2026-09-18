@@ -12,6 +12,7 @@
 """
 
 import json
+import os
 import logging
 import re
 import sys
@@ -180,6 +181,15 @@ def main():
             log.warning("группа %s: нужна капча — разослана", gid)
             continue
         except Backoff:
+            # задание Mac-ретранслятору (достанет через домашний IP)
+            try:
+                os.makedirs("/opt/gubkin/multi/cache/fetch_jobs", exist_ok=True)
+                with open("/opt/gubkin/multi/cache/fetch_jobs/%s.json" % gid,
+                          "w", encoding="utf-8") as jf:
+                    json.dump({"gid": gid,
+                               "date": t.strftime("%d-%m-%Y")}, jf)
+            except OSError:
+                pass
             # окно может открыться через секунды — одна повторная попытка
             time.sleep(8)
             try:

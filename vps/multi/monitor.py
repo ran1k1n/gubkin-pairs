@@ -62,7 +62,7 @@ def main():
     time.sleep(2)
 
     # 2) рассыльщик: cron.log свежее 20 минут
-    age = mtime_age(CACHE_DIR / "cron.log")
+    age = mtime_age(Path(str(CACHE_DIR).replace("/cache", "")) / "cron.log")
     if age is not None and age > 1200:
         problems.append("⏰ Рассыльщик не запускался %d минут — проверьте cron."
                         % (age // 60))
@@ -89,6 +89,15 @@ def main():
         except ValueError:
             stale.append("%s: кэш повреждён" % info["name"])
     if stale:
+        # задания Mac-ретранслятору: добыть свежие данные через домашний IP
+        job_dir = "/opt/gubkin/multi/cache/fetch_jobs"
+        os.makedirs(job_dir, exist_ok=True)
+        for gid, info in groups.items():
+            job_f = os.path.join(job_dir, "%s.json" % gid)
+            if not os.path.exists(job_f):
+                with open(job_f, "w", encoding="utf-8") as jf:
+                    json.dump({"gid": gid,
+                               "date": t.strftime("%d-%m-%Y")}, jf)
         key = "stale_alert"
         prev_alert = st.get(key)
         too_soon = False
