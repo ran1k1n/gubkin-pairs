@@ -738,8 +738,11 @@ def main():
                 time.sleep(2)
                 continue
 
+        # адаптивно: длинный опрос в норме; после сбоев — короткие
+        # мгновенные опросы раз в секунду (сообщения подхватываются быстро)
+        lp = 25 if tg_fail_streak < 3 else 0
         try:
-            res = tg("getUpdates", TOKEN, offset=offset, timeout=25,
+            res = tg("getUpdates", TOKEN, offset=offset, timeout=lp,
                      allowed_updates=["message", "callback_query"])
             tg_fail_streak = 0
             try:

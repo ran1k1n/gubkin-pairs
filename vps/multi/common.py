@@ -523,21 +523,22 @@ def classes_on_date(week, day):
 TG_IP_PATH = CACHE_DIR / "tg_ip.txt"
 
 
-def _tg_ip():
+def _tg_ips():
+    """Список известных живых IP (через пробел в файле)."""
     try:
-        ip = TG_IP_PATH.read_text().strip()
-        return ip or None
+        return TG_IP_PATH.read_text().split()
     except OSError:
-        return None
+        return []
 
 
 def _tg_find_ip():
-    """Замеряет каждый IP api.telegram.org реальным HTTPS-запросом
-    и возвращает САМЫЙ БЫСТРЫЙ (часть адресов зависает на SNI-фильтре,
-    часть просто медленная — разница до 10 секунд на сообщение)."""
+    """Параллельно замеряет каждый IP api.telegram.org реальным
+    HTTPS-запросом и сохраняет ТОП-3 самых быстрых (часть адресов
+    зависает на SNI-фильтре, часть медленная)."""
     import socket
     import subprocess
     import time as _t
+    from concurrent.futures import ThreadPoolExecutor
     try:
         infos = socket.getaddrinfo("api.telegram.org", 443, socket.AF_INET)
     except OSError:
@@ -547,40 +548,47 @@ def _tg_find_ip():
         ip = info[4][0]
         if ip not in ips:
             ips.append(ip)
-    scored = []
-    for ip in ips:
+
+    def probe(ip):
         t0 = _t.time()
         try:
             r = subprocess.run(
                 ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
                  "--resolve", "api.telegram.org:443:%s" % ip,
-                 "--connect-timeout", "3", "--max-time", "5",
+                 "--connect-timeout", "2", "--max-time", "4",
                  "https://api.telegram.org/"],
-                capture_output=True, timeout=7)
+                capture_output=True, timeout=6)
             dt = _t.time() - t0
-            if r.stdout.decode().strip() in ("200", "302") and dt < 5:
-                scored.append((dt, ip))
+            if r.stdout.decode().strip() in ("200", "302") and dt < 4:
+                return (dt, ip)
         except Exception:
-            continue
-    if not scored:
+            pass
         return None
-    scored.sort()
-    best = scored[0][1]
-    TG_IP_PATH.write_text(best)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(ips))) as ex:
+        results = [x for x in ex.map(probe, ips) if x]
+    if not results:
+        return None
+    results.sort()
+    best = results[0][1]
+    TG_IP_PATH.write_text(" ".join(ip for _, ip in results))
     return best
 
 
 def tg(api_method, token, files=None, **params):
-    """Вызов Bot API через curl с закреплённым самым быстрым IP.
-    При сбое — автоматический переиск и один повтор."""
+    """Вызов Bot API через curl. Самый быстрый IP закрепляется заранее;
+    топ-2 живых IP идут в один запрос (перебор средствами curl).
+    Пустой ответ (висение) = сообщение считаем доставленным (антидубль)."""
     url = "https://api.telegram.org/bot%s/%s" % (token, api_method)
-    long_poll = api_method == "getUpdates"
+    timeout_v = int(params.get("timeout") or 0)
+    long_poll = api_method == "getUpdates" and timeout_v >= 5
     cmd = ["curl", "-s", "--connect-timeout", "3",
-           "--max-time", "45" if long_poll else "8"]
-    ip = _tg_ip()
-    if not ip:
-        ip = _tg_find_ip()
-    if ip:
+           "--max-time", "35" if long_poll else "8"]
+    ips = _tg_ips()
+    if not ips:
+        found = _tg_find_ip()
+        ips = [found] if found else []
+    for ip in ips[:2]:
         cmd += ["--resolve", "api.telegram.org:443:%s" % ip]
     if files:
         import tempfile
@@ -613,25 +621,20 @@ def tg(api_method, token, files=None, **params):
         r = subprocess.run(cmd, capture_output=True, timeout=60)
     body = r.stdout.decode("utf-8", "replace")
     if not body:
-        # IP перестал отвечать — переиск и один повтор
+        # закреплённые IP легли — параллельный переиск и один повтор
         try:
             TG_IP_PATH.unlink()
         except OSError:
             pass
-        fresh = _tg_find_ip()  # параллельный замер, сохраняет топ живых
-        fresh_ips = _tg_ips()[:2]
-        if fresh_ips:
-            cmd = [x for x in cmd if not x.startswith("api.telegram.org:443:")]
-            for ip2 in fresh_ips:
+        found = _tg_find_ip()
+        if found:
+            cmd = [x for x in cmd if not str(x).startswith(
+                "api.telegram.org:443:")]
+            all_ips = _tg_ips()[:2] or [found]
+            for ip2 in all_ips:
                 cmd += ["--resolve", "api.telegram.org:443:%s" % ip2]
             r = subprocess.run(cmd, capture_output=True, timeout=60)
             body = r.stdout.decode("utf-8", "replace")
-        # IP перестал отвечать — сбрасываем пин; следующий вызов
-        # сам параллельным замером найдёт самый быстрый живой IP
-        try:
-            TG_IP_PATH.unlink()
-        except OSError:
-            pass
     if not body:
         # висение без ответа: чаще всего сообщение ДОСТАВЛЕНО, а потерян
         # только ответ. Повтор = дубль у пользователя. Считаем успехом.
