@@ -4,12 +4,14 @@
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import timedelta
+from pathlib import Path
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
@@ -611,6 +613,8 @@ def main():
     except (OSError, ValueError):
         offset = 0
 
+    PENDING_OUT = CACHE_DIR / "pending_sends.json"
+
     def send(chat_id, text, reply_markup=None):
         params = {"chat_id": chat_id, "text": text}
         if reply_markup:
@@ -621,6 +625,15 @@ def main():
             except Exception as e:
                 log.warning("sendMessage: %s (попытка %d)", e, attempt + 1)
                 time.sleep(2)
+        # канал мёртв — сообщение в очередь, её разносит Mac-ретранслятор
+        try:
+            q = json.loads(PENDING_OUT.read_text(encoding="utf-8")) \
+                if PENDING_OUT.exists() else []
+            q.append({"chat_id": chat_id, "text": text})
+            PENDING_OUT.write_text(
+                json.dumps(q[-500:], ensure_ascii=False), encoding="utf-8")
+        except Exception as e2:
+            log.warning("очередь тоже не удалась: %s", e2)
 
     # меню команд с подсказками — действует на всех пользователей,
     # текущих и будущих (Telegram показывает его в кнопке «Меню»)
@@ -665,13 +678,60 @@ def main():
             finally:
                 uconn.close()
 
+    tg_fail_streak = 0
+    probe_counter = 0
+    flag_path = CACHE_DIR / "tg_down"
+    spool_dir = CACHE_DIR / "updates_in"
+    spool_dir.mkdir(exist_ok=True)
+
+    def drain_spool():
+        """Обработка обновлений, relay-нутых с Mac (пока прямой канал закрыт)."""
+        import glob as _g
+        for f in sorted(_g.glob(str(spool_dir / "*.json"))):
+            try:
+                upds = json.loads(Path(f).read_text(encoding="utf-8"))
+            except Exception:
+                os.unlink(f)
+                continue
+            for upd in (upds if isinstance(upds, list) else []):
+                try:
+                    process_update(upd)
+                except Exception:
+                    log.exception("spool update")
+            os.unlink(f)
+
     log.info("бот запущен, offset=%d", offset)
     while True:
         try:
+            drain_spool()
+        except Exception:
+            log.exception("drain_spool")
+
+        # при устойчивом сбое канал приёма берёт на себя Mac (флаг tg_down);
+        # VPS лишь изредка пробует вернуть канал себе
+        if flag_path.exists():
+            probe_counter += 1
+            if probe_counter % 10:  # 9 циклов из 10 — ждём, 1 — пробуем
+                drain_spool()
+                time.sleep(2)
+                continue
+
+        try:
             res = tg("getUpdates", TOKEN, offset=offset, timeout=25,
                      allowed_updates=["message", "callback_query"])
+            tg_fail_streak = 0
+            try:
+                flag_path.unlink()
+            except OSError:
+                pass
         except Exception as e:
             log.warning("getUpdates: %s", e)
+            tg_fail_streak += 1
+            if tg_fail_streak >= 5:
+                try:
+                    flag_path.write_text(t.isoformat())
+                except OSError:
+                    pass
             time.sleep(1)
             continue
         for upd in res or []:
