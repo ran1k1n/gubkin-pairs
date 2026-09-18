@@ -93,8 +93,19 @@ def main():
                     sent[rkey] = 1
                     sender.send(int(CFG["admin_chat_id"]), msgs[left])
 
+    # сначала та группа, чьи данные самые старые (равный доступ к окнам)
+    def cache_age(gid):
+        import common
+        c = common.load_sched(gid)
+        try:
+            return __import__("datetime").datetime.fromisoformat(
+                (c or {}).get("fetched_at", "")).timestamp()
+        except (ValueError, TypeError):
+            return 0
+
+    ordered = sorted(groups.items(), key=lambda kv: cache_age(kv[0]))
     first = True
-    for gid, info in groups.items():
+    for gid, info in ordered:
         if not first:
             time.sleep(5)  # щадящий интервал: WAF университета чувствителен
         first = False
@@ -169,8 +180,15 @@ def main():
             log.warning("группа %s: нужна капча — разослана", gid)
             continue
         except Backoff:
-            log.warning("группа %s: сайт недоступен, пропуск", gid)
-            continue
+            # окно может открыться через секунды — одна повторная попытка
+            time.sleep(8)
+            try:
+                week = get_week(gid, force=need_refresh,
+                                max_age_min=None if need_refresh
+                                else REFRESH_MIN)
+            except Exception:
+                log.warning("группа %s: сайт недоступен, пропуск", gid)
+                continue
         except Exception as e:
             log.error("группа %s: %s", gid, e)
             continue
