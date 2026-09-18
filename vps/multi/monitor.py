@@ -145,7 +145,9 @@ def main():
         site_ok = True
     except Exception:
         site_ok = False
-    if site_ok:
+    if site_ok and not CFG.get("fetch_via_mac"):
+        # в Mac-first режиме сервер не светится перед сайтом:
+        # обновления через Mac-задания, прямой заход — не нужен
         fixed = 0
         for gid, info in groups.items():
             try:

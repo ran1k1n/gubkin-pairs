@@ -127,8 +127,10 @@ def main():
                     same_day = fdt.date() == today
                 except ValueError:
                     age_min, same_day = 10**9, False
-                # РОВНО 2 захода на сайт в сутки на группу (щадяще для WAF):
-                # утро — первое обновление дня, 13:00-13:59 — проверка отмен
+                # РОВНО 2 захода в сутки на группу. Куда ходить — решает
+                # fetch_via_mac: true = через Mac (домашний IP, неследуемо),
+                # false = напрямую с сервера. Прямой заход — аварийный
+                # запасной, только если задание Mac висит больше 2 часов.
                 if not same_day:
                     need_refresh = 6 <= t.hour < 20 or t.hour < 2
                 elif (13 <= t.hour < 14
@@ -138,9 +140,29 @@ def main():
                     need_refresh = False
             else:
                 need_refresh = 6 <= t.hour < 20 or t.hour < 2
-            week = get_week(gid,
-                            force=need_refresh,
-                            max_age_min=None if need_refresh else REFRESH_MIN)
+            week = None
+            if need_refresh and CFG.get("fetch_via_mac"):
+                job_dir = "/opt/gubkin/multi/cache/fetch_jobs"
+                os.makedirs(job_dir, exist_ok=True)
+                job_f = os.path.join(job_dir, "%s.json" % gid)
+                stale_job = False
+                try:
+                    stale_job = (time.time() - os.path.getmtime(job_f)) > 7200
+                except OSError:
+                    pass
+                if not stale_job:
+                    with open(job_f, "w", encoding="utf-8") as jf:
+                        json.dump({"gid": gid,
+                                   "date": t.strftime("%d-%m-%Y")}, jf)
+                    week = cache
+                    log.warning("группа %s: задание Mac-ретранслятору", gid)
+                    # обработка группы продолжится на имеющемся кэше
+            if week is None and (not CFG.get("fetch_via_mac") or stale_job
+                                 or not need_refresh):
+                week = get_week(gid,
+                                force=need_refresh,
+                                max_age_min=None if need_refresh
+                                else REFRESH_MIN)
         except CaptchaNeeded:
             # разослать капчу всем подписчикам: любой введённый код
             # разблокирует общую сессию для всей системы
@@ -214,6 +236,8 @@ def main():
             except Exception:
                 pass
 
+        if week is None:
+            week = cache or {"week_days": [], "lessons": []}
         lessons_today = classes_on_date(week, t)
         today_wd = None
         for d in week.get("week_days", []):
