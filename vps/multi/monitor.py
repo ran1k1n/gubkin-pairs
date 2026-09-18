@@ -58,6 +58,7 @@ def main():
                        capture_output=True, timeout=10)
     if r.stdout.decode().strip() != "active":
         subprocess.run(["systemctl", "restart", "gubkin-bot"], timeout=30)
+        time.sleep(3)
         problems.append("🚑 Сервис бота был выключен — перезапустил автоматически.")
     time.sleep(2)
 
@@ -178,10 +179,14 @@ def main():
         with open(CACHE_DIR / "selfrepair.log", "a", encoding="utf-8") as f:
             f.write("\n".join(repairs) + "\n")
 
-    if problems:
-        for p in problems:
-            if admin:
-                sender.send(admin, "🩺 " + p)
+    # молча: всё, что починено и найдено, уйдёт в вечерний дайджест.
+    # Мгновенный алерт — только если бот не поднялся после рестарта.
+    if any("Сервис бота" in p for p in problems):
+        r2 = subprocess.run(["systemctl", "is-active", "gubkin-bot"],
+                            capture_output=True, timeout=10)
+        if r2.stdout.decode().strip() != "active" and admin:
+            sender.send(admin, "🚨 Бот не поднялся после автоперезапуска — "
+                               "смотрите вечерний статус.")
     save_state(st)
 
 
