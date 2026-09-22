@@ -401,7 +401,14 @@ def _norm_week(raw, group_id):
                 "moved": bool(l.get("isMoved")),
                 "changed": bool(l.get("changes")),
             })
-    lessons.sort(key=lambda x: (x["wd"], x["start"]))
+    def tkey(s):
+        try:
+            h, m = s.split(":")
+            return (int(h), int(m))
+        except (ValueError, AttributeError):
+            return (99, 99)
+
+    lessons.sort(key=lambda x: (x["wd"], tkey(x["start"])))
     return {"week_days": week_days, "lessons": lessons}
 
 
@@ -636,11 +643,26 @@ def tg(api_method, token, files=None, **params):
             r = subprocess.run(cmd, capture_output=True, timeout=60)
             body = r.stdout.decode("utf-8", "replace")
     if not body:
-        # висение без ответа: чаще всего сообщение ДОСТАВЛЕНО, а потерян
-        # только ответ. Повтор = дубль у пользователя. Считаем успехом.
-        log.warning("telegram %s: пустой ответ — считаю доставленным "
-                    "(антидубль)", api_method)
-        return {"ok": True, "ambiguous": True}
+        # пустой ответ неоднозначен: либо доставлено и потерян ответ,
+        # либо сеть лежит. Контрольный запрос различает эти случаи:
+        # сеть жива -> считаем доставленным (не дублируем);
+        # сеть мертва -> исключение, отправитель поставит в очередь.
+        net_ok = False
+        for _ in range(2):
+            p = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "--connect-timeout", "3", "--max-time", "5",
+                 "https://api.telegram.org/"],
+                capture_output=True, timeout=8)
+            if p.stdout.decode().strip() in ("200", "302"):
+                net_ok = True
+                break
+            time.sleep(1)
+        if net_ok:
+            log.warning("telegram %s: пустой ответ при живой сети — "
+                        "считаю доставленным (антидубль)", api_method)
+            return {"ok": True, "ambiguous": True}
+        raise RuntimeError("telegram %s: сеть недоступна" % api_method)
     d = json.loads(body)
     if d.get("ok") is not True:
         raise RuntimeError("telegram %s: %s" % (api_method, d))
