@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import shutil
 import threading
 import time
 import urllib.error
@@ -721,6 +722,18 @@ def main():
                 except Exception:
                     log.exception("spool update")
             os.unlink(f)
+
+    # самолечение: если бот прожил 3 минуты без крашей, фиксируем свой
+    # файл как заведомо рабочий (сторож откатится на него при крах-лупе)
+    def stable_snapshot():
+        time.sleep(180)
+        try:
+            shutil.copy2(os.path.abspath(__file__),
+                         str(CACHE_DIR / "bot.py.stable"))
+            log.info("стабильная версия зафиксирована")
+        except Exception as e:
+            log.warning("snapshot: %s", e)
+    threading.Thread(target=stable_snapshot, daemon=True).start()
 
     # прогрев канала Telegram: каждую минуту меряем закреплённый IP;
     # если он стал медленным — заранее ищем быстрый (пользователь не заметит)
