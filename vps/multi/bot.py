@@ -722,6 +722,33 @@ def main():
                     log.exception("spool update")
             os.unlink(f)
 
+    # прогрев канала Telegram: каждую минуту меряем закреплённый IP;
+    # если он стал медленным — заранее ищем быстрый (пользователь не заметит)
+    def tg_keepalive():
+        while True:
+            try:
+                import common
+                ip = common._tg_ips()
+                if not ip:
+                    common._tg_find_ip()
+                else:
+                    r = subprocess.run(
+                        ["curl", "-s", "-o", "/dev/null", "-w", "%{time_total}",
+                         "--resolve", "api.telegram.org:443:%s" % ip[0],
+                         "--connect-timeout", "3", "--max-time", "5",
+                         "https://api.telegram.org/"],
+                        capture_output=True, timeout=8)
+                    dt = r.stdout.decode().strip()
+                    try:
+                        if float(dt) > 2.0:
+                            common._tg_find_ip()
+                    except ValueError:
+                        common._tg_find_ip()
+            except Exception:
+                pass
+            time.sleep(60)
+
+    threading.Thread(target=tg_keepalive, daemon=True).start()
     log.info("бот запущен, offset=%d", offset)
     while True:
         try:
