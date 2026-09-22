@@ -65,10 +65,26 @@ def main():
     # 2) рассыльщик: cron.log свежее 20 минут
     age = mtime_age(Path(str(CACHE_DIR).replace("/cache", "")) / "cron.log")
     if age is not None and age > 1200:
-        problems.append("⏰ Рассыльщик не запускался %d минут — проверьте cron."
-                        % (age // 60))
+        try:
+            subprocess.run(["python3", "/opt/gubkin/multi/notifier.py"],
+                           capture_output=True, timeout=300,
+                           cwd="/opt/gubkin/multi")
+            problems.append("⏰ Рассыльщик молчал %d мин — запустил его "
+                            "вручную." % (age // 60))
+        except Exception as e:
+            problems.append("⏰ Рассыльщик не запускается: %s" % str(e)[:60])
     elif age is None:
         problems.append("⏰ Лог рассыльщика не найден.")
+
+    # повреждённые кэши — удалить (перекачаются автоматически)
+    import glob as _g
+    for f in _g.glob(str(CACHE_DIR / "sched_*.json")):
+        try:
+            json.loads(Path(f).read_text(encoding="utf-8"))
+        except Exception:
+            os.remove(f)
+            problems.append("🗑 Повреждённый кэш %s удалён — перекачается."
+                            % os.path.basename(f))
 
     # 3) свежесть кэша подписанных групп
     groups = users_by_group(__import__("common").db())
@@ -129,6 +145,15 @@ def main():
                                 "(висела больше 2 часов).")
     except (OSError, ValueError):
         pass
+
+    # осиротевшие результаты добычи — прогнать через ingestion
+    for f in _g.glob(str(CACHE_DIR / "fetch_results" / "*.json")):
+        try:
+            subprocess.run(["python3", "/opt/gubkin/multi/fetch_ingest.py", f],
+                           capture_output=True, timeout=60)
+            os.remove(f)
+        except Exception:
+            pass
 
     # 5) попытка протолкнуть очередь недоставленных сообщений
     try:
@@ -193,4 +218,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        err = traceback.format_exc()[-600:]
+        try:
+            with open(CACHE_DIR / "monitor_last_error.log", "w",
+                      encoding="utf-8") as f:
+                f.write(err)
+        except OSError:
+            pass
+        sys.exit(1)
