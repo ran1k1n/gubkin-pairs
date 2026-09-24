@@ -116,6 +116,8 @@ def main():
         # --- кэш недели
         need_refresh = False
         cache = None
+        same_day = False
+        fdt = None
         try:
             import common
             cache = common.load_sched(gid)
@@ -141,6 +143,8 @@ def main():
             else:
                 need_refresh = 6 <= t.hour < 20 or t.hour < 2
             week = None
+            stale_job = False
+            fetch_failed = False
             if need_refresh and CFG.get("fetch_via_mac"):
                 job_dir = "/opt/gubkin/multi/cache/fetch_jobs"
                 os.makedirs(job_dir, exist_ok=True)
@@ -220,11 +224,14 @@ def main():
                                 max_age_min=None if need_refresh
                                 else REFRESH_MIN)
             except Exception:
-                log.warning("группа %s: сайт недоступен, пропуск", gid)
-                continue
+                # сайт заблокирован — сводка уйдёт из кэша с пометкой
+                log.warning("группа %s: сайт недоступен — сводка из кэша", gid)
+                fetch_failed = True
+                week = cache or {"week_days": [], "lessons": []}
         except Exception as e:
-            log.error("группа %s: %s", gid, e)
-            continue
+            log.error("группа %s: %s — сводка из кэша", gid, e)
+            fetch_failed = True
+            week = cache or {"week_days": [], "lessons": []}
 
         if 13 <= t.hour < 14:
             try:
@@ -320,16 +327,20 @@ def main():
 
         live = [l for l in lessons_today if not l.get("cancelled")]
 
-        # --- утренняя сводка
+        # --- утренняя сводка: окно 07:30-08:30, либо из кэша при блоке
         skey = "summary:%s:%s" % (gid, today_key)
         summary_dt = t.replace(hour=7, minute=30, second=0, microsecond=0)
-        if (summary_dt <= t < summary_dt + timedelta(minutes=60)
-                and skey not in sent):
+        covers_today = any(d.get("date") == t.strftime("%d-%m-%Y")
+                           for d in week.get("week_days", []))
+        summary_due = ((summary_dt <= t < summary_dt + timedelta(minutes=60))
+                       or (fetch_failed and covers_today and t.hour >= 7))
+        if summary_due and skey not in sent:
             sent[skey] = 1
-            sender.broadcast(
-                chats,
-                lessons_text(lessons_today,
-                             "🌅 Пары на сегодня, группа %s" % gname))
+            header = "🌅 Пары на сегодня, группа %s" % gname
+            if fetch_failed or not same_day:
+                fd = (fdt.strftime("%d.%m") if fdt else "ранее")
+                header += "\n(данные от %s — сайт был недоступен)" % fd
+            sender.broadcast(chats, lessons_text(lessons_today, header))
 
         # --- напоминания за 15 минут
         lead = CFG.get("minutes_before_class", 15)
