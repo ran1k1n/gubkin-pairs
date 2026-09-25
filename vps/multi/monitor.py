@@ -38,6 +38,10 @@ def save_state(st):
     STATE_PATH.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
 
 
+def info_name(groups, gid):
+    return groups.get(gid, {}).get("name", str(gid))
+
+
 def mtime_age(path):
     try:
         return time.time() - Path(path).stat().st_mtime
@@ -153,6 +157,46 @@ def main():
             subprocess.run(["python3", "/opt/gubkin/multi/fetch_ingest.py", f],
                            capture_output=True, timeout=60)
             os.remove(f)
+        except Exception:
+            pass
+
+    # сверка расписания с сайтом каждые 6 часов (00/06/12/18 + 5 мин):
+    # свежая добыча -> сравнение с кэшем -> алерт при расхождении
+    if t.hour in (0, 6, 12, 18) and 5 <= t.minute < 25 and groups:
+        try:
+            import common
+            fresh_all = {}
+            for gid, info in groups.items():
+                try:
+                    if common.backoff_active():
+                        break
+                    fresh_all[gid] = common.get_week(gid, force=True,
+                                                     max_age_min=None)
+                    time.sleep(4)
+                except Exception:
+                    pass
+            diffs = []
+            for gid, fresh in fresh_all.items():
+                c = common.load_sched(gid)
+                if not c:
+                    continue
+                a = sorted((l.get("wd"), l.get("start"), l.get("subject"))
+                           for l in fresh.get("lessons", [])
+                           if not l.get("cancelled"))
+                b = sorted((l.get("wd"), l.get("start"), l.get("subject"))
+                           for l in c.get("lessons", [])
+                           if not l.get("cancelled"))
+                if a != b:
+                    diffs.append("%s: было %d пар, стало %d"
+                                 % (info_name(groups, gid), len(b), len(a)))
+            if diffs:
+                key = "sched_diff"
+                prev = st.get(key)
+                today_str = t.date().isoformat()
+                if not prev or (t - __import__("datetime").datetime.fromisoformat(prev)).total_seconds() > 21600:
+                    st[key] = t.isoformat()
+                    problems.append("📋 Сверка расписания: отличия с сайтом —\n"
+                                    + "\n".join("• " + d for d in diffs))
         except Exception:
             pass
 
