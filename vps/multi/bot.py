@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from common import (  # noqa: E402
+    pending_views_load, pending_views_save, format_schedule_view,
     Backoff, CaptchaNeeded, SchedClient, add_user, db, del_user,
     auto_captcha_allow, day_label, get_user, manual_unlock_allow,
     needs_refresh, classes_on_date, touch_user,
@@ -178,9 +179,9 @@ def schedule_command(send, conn, chat_id, gid, gname, mode, day=None):
         wconn = db()
         try:
             week = None
-            # терпеливо: сайт иногда "охлаждается" — фон дожимает до 20 минут
-            # и сам доставляет расписание, пользователю не нужно переспрашивать
-            for attempt in range(20):
+            # до 3 попыток по 15 секунд (~45 сек), затем честный итог;
+            # если данные появятся позже — досвалим автоматически
+            for attempt in range(3):
                 try:
                     week = get_week(gid, day=day, max_age_min=None)
                     break
@@ -197,12 +198,19 @@ def schedule_command(send, conn, chat_id, gid, gname, mode, day=None):
                     last = "сайт недоступен"
                 except Exception as e:
                     last = str(e)[:60]
-                if attempt < 19:
-                    time.sleep(60)
+                if attempt < 2:
+                    time.sleep(15)
             if week is None:
-                send(chat_id, "⏳ Сайт университета не отвечал 20 минут — "
-                              "попробуйте позже (напоминания работают "
-                              "независимо от этого).")
+                send(chat_id, "⏳ Сайт университета так и не ответил за отведённое "
+                              "время. Я запомнил запрос — пришлю расписание, как "
+                              "только сайт ответит.")
+                try:
+                    pv = pending_views_load()
+                    pv.append({"chat_id": chat_id, "gid": gid,
+                               "gname": gname, "mode": mode})
+                    pending_views_save(pv)
+                except Exception as e2:
+                    log.warning("pending view: %s", e2)
                 return
 
             if mode == "week":

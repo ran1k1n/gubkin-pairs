@@ -233,6 +233,27 @@ def main():
             fetch_failed = True
             week = cache or {"week_days": [], "lessons": []}
 
+        # досылка отложенных показов: чей-то /today /week во время блока
+        try:
+            import common
+            pv = common.pending_views_load()
+            still = []
+            for item in pv:
+                if item.get("gid") != gid:
+                    still.append(item)
+                    continue
+                try:
+                    sender.send(item["chat_id"],
+                                common.format_schedule_view(
+                                    week, item.get("mode", "today"),
+                                    info["name"], t))
+                except Exception as e:
+                    log.warning("отложенный показ %s: %s",
+                                item.get("chat_id"), e)
+            common.pending_views_save(still)
+        except Exception as e:
+            log.warning("pending views: %s", e)
+
         if 13 <= t.hour < 14:
             try:
                 import common

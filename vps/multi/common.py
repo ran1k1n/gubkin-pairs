@@ -15,6 +15,7 @@ import logging
 import re
 import sqlite3
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -509,6 +510,75 @@ def needs_refresh(gid, day=None, max_age_min=None):
     if max_age_min is not None:
         return (now() - fdt) > timedelta(minutes=max_age_min)
     return fdt.date() != now().date()
+
+
+PENDING_VIEWS = CACHE_DIR / "pending_views.json"
+
+
+def pending_views_load():
+    try:
+        with open(PENDING_VIEWS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def pending_views_save(items):
+    with open(PENDING_VIEWS, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False)
+
+
+def format_schedule_view(week, mode, gname, day):
+    """Текст расписания для /today | /tomorrow | /week."""
+    wt = week.get("week_type")
+    wt_label = {"upper": "верхняя (нечётная)",
+                "lower": "нижняя (чётная)"}.get(wt, "")
+    wd_by_num = {d.get("weekDayNumber"): d.get("date")
+                 for d in week.get("week_days", [])}
+    day = day.date() if isinstance(day, datetime) else day
+    date_str = day.strftime("%d-%m-%Y")
+    wd = wd_by_num.get(date_str) or next(
+        (d.get("weekDayNumber") for d in week.get("week_days", [])
+         if d.get("date") == date_str), None)
+
+    def lessons_on(date_d):
+        ds = date_d.strftime("%d-%m-%Y")
+        w = wd_by_num.get(ds)
+        if w is None:
+            return []
+        return [l for l in week.get("lessons", []) if l.get("wd") == w]
+
+    if mode == "week":
+        out = ["🗓 Неделя%s, группа %s" % (" (%s)" % wt_label if wt_label else "",
+                                           gname)]
+        for wd in sorted({l.get("wd") for l in week.get("lessons", [])
+                          if not l.get("cancelled")}):
+            ds = wd_by_num.get(wd)
+            if not ds:
+                continue
+            try:
+                dd = datetime.strptime(ds, "%d-%m-%Y")
+            except ValueError:
+                continue
+            out.append("")
+            out.append("— %s —" % day_label(dd))
+            for l in lessons_on(dd):
+                if l.get("cancelled"):
+                    out.append("❌ %s отменена (%s)" % (l.get("subject"),
+                                                       l.get("start")))
+                else:
+                    out.append("• " + format_class(l))
+        return "\n".join(out) or "Расписание на неделю пустое."
+
+    les = lessons_on(day)
+    header = "📅 %s, группа %s" % (day_label(day), gname)
+    if wt:
+        header += " — неделя %s" % wt_label
+    if mode == "tomorrow":
+        header = "📅 Завтра, %s, группа %s" % (day_label(day), gname)
+        if wt:
+            header += " — неделя %s" % wt_label
+    return lessons_text(les, header)
 
 
 def classes_on_date(week, day):
